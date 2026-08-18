@@ -9,6 +9,7 @@ from agent_framework_foundry_hosting import ResponsesHostServer
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 from tools import convert_currency, get_local_time, get_weather
+from agent_framework_foundry_hosting import FoundryToolbox, ResponsesHostServer
 
 
 load_dotenv(override=True)
@@ -16,25 +17,31 @@ load_dotenv(override=True)
 
 def main() -> None:
     # Foundry model client, built from your .env settings.
-    client = FoundryChatClient(
-        project_endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
-        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"],
-        credential=DefaultAzureCredential(),
-    )
 
     # TODO: write TravelBuddy's system instructions. Describe a friendly travel
     # assistant that gives practical, concise trip-planning advice — local context,
     # budget awareness, and safety-minded tips.
 
+
+    credential = DefaultAzureCredential()
+
+    client = FoundryChatClient(
+        project_endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"],
+        credential=credential,                # <-- reuse the same credential
+    )
+
+    toolbox = FoundryToolbox(credential)
+
     agent = Agent(
         client=client,
         name="travel-buddy",
-        instructions="a friendly travel assistant that gives practical, concise trip-planning advice with local context, budget awareness, and safety-minded tips",
-        tools=[get_weather, get_local_time, convert_currency, client.get_mcp_tool(                          # <-- add this entry
-            name=os.environ["MCP_SERVER_LABEL"],
-            url=os.environ["MCP_SERVER_URL"],
-            approval_mode="never_require",
-        ),],  # <-- add this line
+        instructions="Use the Foundry Toolbox for flight search (when the traveler gives no "
+            "departure date, call get_local_time and use the date part of its "
+            "iso_time as today's date), for web search of current "
+            "travel advisories and events, and for Code Interpreter to analyze an "
+            "uploaded itinerary.csv (budget totals, currency conversion, charts).",
+        tools=[get_weather, get_local_time, convert_currency, toolbox],  # <-- add this line
         default_options={"store": False},
     )
 

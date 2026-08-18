@@ -23,3 +23,5 @@ environment_variables:
   # with other attendees deploying into a shared project.
   - name: WORKSHOP_RESOURCE_PREFIX
     value: ${WORKSHOP_RESOURCE_PREFIX}
+  - name: TOOLBOX_ENDPOINT          # <-- added
+    value: ${TOOLBOX_ENDPOINT}  

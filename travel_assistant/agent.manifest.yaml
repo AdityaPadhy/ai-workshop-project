@@ -16,8 +16,9 @@
 name: travel-buddy
 description: >
   TravelBuddy is an Agent Framework hosted agent with local Python function tools
-  for weather, local time, and currency, plus an OctoTrip Flights MCP connection for
-  live flight search.
+  for weather, local time, and currency, plus a Foundry Toolbox that bundles web
+  search, Code Interpreter, and the OctoTrip flights MCP server behind one
+  project-managed endpoint.
 metadata:
   tags:
     - Agent Framework
@@ -27,6 +28,8 @@ metadata:
     - Travel Assistant
     - Function Tools
     - MCP Tools
+    - Toolbox Tools          # <-- added
+   
   tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
     - name: get_weather
       description: Returns mock destination weather for a city and optional date.
@@ -43,10 +46,12 @@ metadata:
         amount: float
         from_currency: string
         to_currency: string 
-    - name: octotrip-flights         # <-- added: the remote MCP tool group
-      description: OctoTrip Flights MCP server for live flight search.
-      type: mcp
-      url: ${MCP_SERVER_URL}     
+    - name: travel-toolbox                       # <-- replaces the octotrip-flights mcp entry
+      description: >
+        Foundry Toolbox bundling web_search, code_interpreter, and the OctoTrip
+        flights MCP server, consumed from one project-managed endpoint.
+      type: toolbox
+      endpoint: ${TOOLBOX_ENDPOINT}         
 template:
   name: travel-buddy
   kind: hosted
@@ -60,10 +65,8 @@ template:
       value: ${AZURE_AI_MODEL_DEPLOYMENT_NAME}
     - name: WORKSHOP_RESOURCE_PREFIX
       value: ${WORKSHOP_RESOURCE_PREFIX}
-    - name: MCP_SERVER_LABEL         # <-- added
-      value: ${MCP_SERVER_LABEL}
-    - name: MCP_SERVER_URL           # <-- added
-      value: ${MCP_SERVER_URL}
+    - name: TOOLBOX_ENDPOINT         # <-- added
+      value: ${TOOLBOX_ENDPOINT}
     
 # No provisioned resources: you already deployed a model in setup (Step 0), and the
 # agent selects it at runtime through the AZURE_AI_MODEL_DEPLOYMENT_NAME env var
