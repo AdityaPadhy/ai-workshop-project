@@ -21,7 +21,7 @@ services:
                 cpu: "0.5"
                 memory: 1Gi
         description: |
-            A basic Agent Framework travel assistant hosted by Foundry.
+            TravelBuddy is an Agent Framework hosted agent with local Python function tools for destination weather, local time, and currency conversion.
         kind: hosted
         metadata:
             tags:
@@ -30,6 +30,23 @@ services:
                 - Azure AI AgentServer
                 - Responses Protocol
                 - Travel Assistant
+                - Function Tools
+            tool_declarations:
+                - description: Returns mock destination weather for a city and optional date.
+                  name: get_weather
+                  parameters:
+                    city: string
+                    date: string | null
+                - description: Returns the current local time for a destination city.
+                  name: get_local_time
+                  parameters:
+                    city: string
+                - description: Converts mock travel prices between USD, EUR, JPY, and GBP.
+                  name: convert_currency
+                  parameters:
+                    amount: float
+                    from_currency: string
+                    to_currency: string
         name: foundry-workshop-apadhy-travel-buddy
         protocols:
             - protocol: responses
