@@ -2,18 +2,18 @@
 
 Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses).
 
-> **Progress:** Step `02` of `9` — **Function tools**  
-> ▰▰▱▱▱▱▱▱▱▱
+> **Progress:** Step `03` of `9` — **MCP integration**  
+> ▰▰▰▱▱▱▱▱▱▱
 
-<!-- step: 02 -->
+<!-- step: 03 -->
 
 <details>
 <summary>Workshop map</summary>
 
 - Step 00 — Setup ✅
 - Step 01 — Basic hosted agent ✅
-- **Step 02 — Function tools**
-- Step 03 — MCP integration
+- Step 02 — Function tools ✅
+- **Step 03 — MCP integration**
 - Step 04 — Foundry Toolbox
 - Step 05 — RAG (Azure AI Search)
 - Step 06 — Skills
@@ -27,215 +27,140 @@ Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/fou
 If something looks broken see [Troubleshooting](.workshop/docs/steps/00-intro.md#troubleshooting).
 
 
-# Step 2 — Give TravelBuddy real-time tools
+# Step 3 — Plug in an MCP server for live flight search
 
-> **Goal:** wire three function tools — weather, local time, currency conversion — into the agent so it can answer time-sensitive questions.
+> **Goal:** wire the **OctoTrip Flights MCP** server into TravelBuddy so it can search real flights from a public, anonymous knowledge source — while keeping the Step 2 function tools.
 
 ## What you'll learn
 
-- How the Agent Framework turns a plain Python function into a tool the model can call
-- How the tool's JSON schema is inferred from your type hints + docstring
-- The full request → tool-call → result → final-answer loop, and who decides when a tool runs
-- Why adding local tools changes your code but **not** your deployment shape
+- What the **Model Context Protocol (MCP)** is and why hosted agents can talk to MCP servers natively
+- The difference between **function tools** (Step 2, local Python) and **MCP tools** (this step, a remote standardised server) — and why they coexist in the same agent
+- How to register a remote MCP server in code with `client.get_mcp_tool(...)` and what `approval_mode` controls
+- How the manifest declares the MCP server's configuration through environment variables
+- Why adding an MCP tool changes your code and config but **not** your deployment shape (still `resources: []`)
 
 ## What's already in the repo
 
-- `travel_assistant/main.py`, `agent.yaml`, `agent.manifest.yaml` — carried over from Step 1 (your TravelBuddy chat agent). Nothing was deleted when you advanced; your Step 1 work is preserved.
-- `travel_assistant/tools.py` — a **stub** laid down for this step with a single `TODO`. You'll implement the three tool functions here.
+- `travel_assistant/main.py`, `travel_assistant/tools.py`, `agent.yaml`, `agent.manifest.yaml` — carried over from Step 2 (your TravelBuddy agent with the three function tools). Nothing was deleted when you advanced; your Step 2 work is preserved.
+- The MCP settings are already listed in `.env.example` (`MCP_SERVER_LABEL`, `MCP_SERVER_URL`); this step starts using them.
 
-In this step you **implement** `tools.py`, then make two small edits to `main.py` (one import + one argument) and one edit to the manifest's description. You do **not** rewrite `main.py` from scratch — you add to the file you finished in Step 1.
+In this step you make **delta-only** edits: add the MCP env vars to `.env`, add one line to `main.py` to register the MCP tool, append one sentence to TravelBuddy's instructions, and update the manifest metadata. You do **not** rewrite `main.py`, `tools.py`, or the YAML files from scratch — you add to the files you finished in Step 2.
 
 ## Concept (5-min read)
 
-TravelBuddy can already hold a conversation, but a chat model only knows what it was trained on. It cannot know **today's** weather in Tokyo, the **current** time in Lisbon, or a **fresh** currency estimate. To answer those questions it needs a way to ask running code for live information — that's what **function tools** are for.
+TravelBuddy already has three **function tools** (weather, local time, currency) — small Python functions that run **in-process** inside its container. That pattern is perfect for capabilities you own and can code. But some capabilities are better consumed as a **service**: a large, live data source (say, real-time flight availability) you don't want to re-implement or redeploy every time it changes. That's where MCP comes in.
 
-A **function tool** is just an ordinary Python function you hand to the agent. In the Agent Framework you register one by passing it in the `tools=[...]` list when you create the `Agent`. The framework then reads the function's **type hints** and **docstring** and builds a JSON schema describing the tool's name, parameters, and purpose. That schema — not your Python source — is what the model sees.
+The **Model Context Protocol (MCP)** is an open standard for connecting AI applications to external tools, data, and prompts. An **MCP server** exposes a set of capabilities (tools, resources, prompts) over a standard protocol; an **MCP client** (here, your hosted agent) connects to that server, discovers what it offers, and calls it when useful. Because the protocol is standardised, the same client can talk to *any* compliant server — GitHub, a database gateway, a docs service — without custom glue for each one.
 
-In OpenAI-Responses-style tool calling, the model never runs your Python directly. Instead the loop looks like this:
+The key contrast with Step 2:
 
-1. The model reads the user's message and the tool schemas.
-2. If it decides a tool would help, it emits a structured **tool call** with JSON arguments (for example `get_weather(city="Tokyo")`).
-3. The Agent Framework matches that call to your Python function, runs it, and captures the return value.
-4. The result is fed back to the model, which then writes the final natural-language answer for the user.
+| | Function tools (Step 2) | MCP tools (this step) |
+| --- | --- | --- |
+| Where the code runs | In-process, in your container | On a **remote** MCP server |
+| Who owns it | You (your Python) | The server operator (here, OctoTrip) |
+| How it's registered | Pass the function in `tools=[...]` | `client.get_mcp_tool(name=..., url=...)` |
+| Tool schema | Inferred from type hints + docstring | Streamed from the server at connect time |
+| Evolves without redeploy | No — you edit and redeploy | Yes — the server can add/update tools |
 
-The framework hides all of that plumbing — the request/response threading, argument parsing, and result formatting. Your job is to write clear functions. Because the **model** decides when to call a tool, good function names, complete type hints, and descriptive docstrings matter: the docstring is effectively the model's instruction manual for the tool.
+Crucially, **from the model's point of view they are all just tools.** The same tool-calling loop from Step 2 applies: the model sees the available tools (local *and* remote), decides which to call, the framework runs the call, and the result flows back into the answer. A single hosted agent can connect to many MCP servers at once, and the model picks the right capability per question.
 
-Each tool in this step is decorated with `@tool(approval_mode="never_require")`. The `@tool` decorator marks the function as a callable tool and lets you configure its behavior; `approval_mode="never_require"` tells the runtime to run it automatically without pausing for human approval — appropriate here because the tools are read-only and return mock data. (Later steps and the [tool-approval docs](https://learn.microsoft.com/agent-framework/agents/tools/tool-approval) cover tools that *should* require a confirmation step.)
-
-For the workshop these tools return **mock** data, but the registration pattern is the real lesson: later you can swap the mock bodies for real weather, time-zone, or exchange-rate APIs without changing how the agent registers them. Note also that local tools run **in-process** inside the same hosted-agent container — they add no new Azure resources, so your `agent.manifest.yaml` and deployment shape barely change from Step 1.
+This step points TravelBuddy at the **OctoTrip Flights MCP** server, a public, anonymous endpoint that searches live flights (routes, prices, times). Weather, time, and currency stay as local function tools (they're small and app-specific); flight search becomes an MCP tool because it's a large, live data source that OctoTrip keeps current for you.
 
 ```mermaid
 flowchart LR
-    User[User] --> Agent[TravelBuddy Agent]
-    Agent -->|tool call + JSON args| Function[Python function]
-    Function -->|JSON-serialisable result| Agent
-    Agent -->|final answer| User
+    User[Traveler question] --> Agent[TravelBuddy hosted agent]
+    Agent --> Decision{Which capability?}
+    Decision -->|weather / time / currency| Local[Function tools<br/>in-process Python]
+    Decision -->|flight search| MCP[OctoTrip Flights<br/>MCP server]
+    MCP --> Docs[(Live flight<br/>availability & prices)]
+    Docs --> MCP
+    Local --> Agent
+    MCP --> Agent
+    Agent --> Answer[Answer with<br/>live flight options]
 ```
+
+`client.get_mcp_tool(...)` is the Agent Framework helper that turns a remote MCP server into a tool the agent can use. You give it a `name` (a stable label that identifies the server in logs and tool-call traces), a `url` (the MCP endpoint), and `approval_mode`. Setting `approval_mode="never_require"` lets the runtime call the server automatically without pausing for human approval — appropriate here because OctoTrip Flights is a read-only, public search source. For servers that mutate state (booking a flight, sending mail), you'd require approval instead.
+
+The upstream `03-mcp` sample connects to the **GitHub** MCP server and passes an `Authorization` header built from a `GITHUB_PAT`. This workshop uses the exact same Agent Framework pattern but points at the **anonymous** OctoTrip Flights endpoint, so no token or header is needed. (The Troubleshooting section shows the authenticated variant if you switch to a server that requires a token.)
 
 Helpful references:
 
-- [Using function tools with an agent](https://learn.microsoft.com/agent-framework/agents/tools/function-tools) — how the Agent Framework turns a Python function into a tool and infers its schema.
-- [Create the agent with function tools](https://learn.microsoft.com/agent-framework/agents/tools/function-tools#create-the-agent-with-function-tools) — passing functions via `tools=[...]`.
-- [Tool approval](https://learn.microsoft.com/agent-framework/agents/tools/tool-approval) — what `approval_mode` controls and when to require confirmation.
-- [Function calling in Microsoft Foundry Agents](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/function-calling) — the tool-calling loop from the Foundry side.
-- [What are hosted agents?](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents) — the hosted boundary your tools run inside.
-- [Upstream `02-tools` hosted-agent sample](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/02-tools) — the sample this step is based on.
+- [What is the Model Context Protocol (MCP)?](https://modelcontextprotocol.io/) — the open standard TravelBuddy speaks to.
+- [OctoTrip Flights MCP server](https://mcp.octotrip.app/flights) — the public, anonymous flight-search server used in this step (streamable HTTP; a single `search` tool taking `origin`, `destination`, and `departure_date`).
+- [Model Context Protocol tools in Microsoft Foundry Agents](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/model-context-protocol) — how Foundry agents connect to MCP servers and what `approval_mode` controls.
+- [Using tools with an agent](https://learn.microsoft.com/agent-framework/agents/tools/function-tools) — the shared tool-calling loop that function tools and MCP tools both flow through.
+- [What are hosted agents?](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents) — the hosted boundary your agent (and its MCP connection) runs inside.
+- [Upstream `03-mcp` hosted-agent sample](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/03-mcp) — the sample this step is based on.
 
 ## Steps
 
-### 1. Implement the tools in `travel_assistant/tools.py`
+### 1. Add the MCP env vars to `.env`
 
-Open the stub `travel_assistant/tools.py` and replace its `TODO` with the three mock functions below. Each is a normal Python function with type hints and a docstring written for the model as much as for a human reader.
+Open `.env` and add the MCP settings. They're already listed in `.env.example`; this step starts using them.
 
-The three tools you're adding:
-
-- **`get_weather(city, date=None)`** — returns mock current-or-planned-date weather for a destination. The optional `date` argument shows how the model can pass extra context when the traveler asks about a specific day; a `None` default makes it optional in the generated schema.
-- **`get_local_time(city)`** — maps a known city to a time zone (via the small `CITY_TIME_ZONES` table) and returns the current local time, falling back to UTC for unknown cities. This is why time-zone answers stay correct without the model guessing.
-- **`convert_currency(amount, from_currency, to_currency)`** — converts a price between USD, EUR, JPY, and GBP using static mock rates, and returns a structured result (with a `note`) when a currency isn't supported instead of raising.
-
-```python
-# travel_assistant/tools.py
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from agent_framework import tool
-
-
-CITY_TIME_ZONES = {
-    "lisbon": "Europe/Lisbon",
-    "london": "Europe/London",
-    "new york": "America/New_York",
-    "reykjavik": "Atlantic/Reykjavik",
-    "san francisco": "America/Los_Angeles",
-    "seattle": "America/Los_Angeles",
-    "tokyo": "Asia/Tokyo",
-}
-
-MOCK_RATES_TO_USD = {
-    "USD": 1.0,
-    "EUR": 1.09,
-    "JPY": 0.0067,
-    "GBP": 1.27,
-}
-
-
-@tool(approval_mode="never_require")
-def get_weather(city: str, date: str | None = None) -> dict:
-    """Return mock weather for a destination city and optional travel date.
-
-    Use this when a traveler asks about current weather, weather for a planned
-    date, packing conditions, or comparing weather across destinations. The data
-    is mocked for the workshop and should be replaced with a real weather API in
-    production.
-    """
-    requested_date = date or "today"
-    return {
-        "city": city,
-        "date": requested_date,
-        "temp_c": 22,
-        "condition": "sunny",
-        "note": "mock data — replace with a real API",
-    }
-
-
-@tool(approval_mode="never_require")
-def get_local_time(city: str) -> dict:
-    """Return the current local time for a city using a small city-to-time-zone map.
-
-    Use this when a traveler asks what time it is in a destination, whether it is
-    a good time to call a hotel, or how time zones compare between cities. Cities
-    outside the workshop map fall back to UTC.
-    """
-    tz_name = CITY_TIME_ZONES.get(city.strip().lower(), "UTC")
-    now = datetime.now(ZoneInfo(tz_name))
-    return {
-        "city": city,
-        "iso_time": now.isoformat(timespec="seconds"),
-        "tz": tz_name,
-    }
-
-
-@tool(approval_mode="never_require")
-def convert_currency(amount: float, from_currency: str, to_currency: str) -> dict:
-    """Convert a mock travel price between USD, EUR, JPY, and GBP.
-
-    Use this for hotel prices, activity costs, meal budgets, or itinerary totals
-    when the traveler asks for an approximate conversion. The exchange rates are
-    static mock values for the workshop.
-    """
-    from_code = from_currency.upper()
-    to_code = to_currency.upper()
-
-    if from_code not in MOCK_RATES_TO_USD or to_code not in MOCK_RATES_TO_USD:
-        return {
-            "input": {"amount": amount, "currency": from_code},
-            "output": None,
-            "rate": None,
-            "note": "mock data — supported currencies: USD, EUR, JPY, GBP",
-        }
-
-    amount_usd = amount * MOCK_RATES_TO_USD[from_code]
-    converted = amount_usd / MOCK_RATES_TO_USD[to_code]
-    rate = MOCK_RATES_TO_USD[from_code] / MOCK_RATES_TO_USD[to_code]
-
-    return {
-        "input": {"amount": amount, "currency": from_code},
-        "output": {"amount": round(converted, 2), "currency": to_code},
-        "rate": round(rate, 6),
-        "note": "mock data",
-    }
+```env
+# .env
+MCP_SERVER_LABEL=octotrip-flights
+MCP_SERVER_URL=https://mcp.octotrip.app/flights/mcp
 ```
 
-**What makes these work as tools:**
+- **`MCP_SERVER_LABEL`** is a short, stable identifier for the server. It becomes the tool group name that shows up in logs and tool-call traces, so keep it predictable and avoid spaces.
+- **`MCP_SERVER_URL`** is the MCP endpoint the agent connects to.
 
-- **The `@tool` decorator** registers each function and its `approval_mode="never_require"` setting so the runtime auto-runs it in the tool-call loop instead of pausing for approval.
-- **Type hints drive the schema.** `city: str`, `amount: float`, and `date: str | None = None` become the tool's parameter types; the `= None` default marks `date` as optional. Use only JSON-serialisable types (`str`, `int`, `float`, `bool`, `dict`, `list`) — the framework can't build a schema for custom classes.
-- **The docstring is the model's manual.** The first line becomes the tool description and the "Use this when…" guidance nudges the model toward the right tool. Vague docstrings are the most common reason a tool never gets called.
-- **Return JSON-friendly data.** Each function returns a `dict` the model can read back and turn into prose. Returning a structured result (with a `note`) for unsupported currencies is friendlier to the model than raising an exception.
+Keep the Foundry values (`AZURE_AI_PROJECT_ENDPOINT`, `AZURE_AI_MODEL_DEPLOYMENT_NAME`, `WORKSHOP_RESOURCE_PREFIX`) in `.env` too. Don't add any secret for OctoTrip Flights MCP — it's public and anonymous.
 
-### 2. Register the tools in `travel_assistant/main.py`
+### 2. Register the MCP tool in `travel_assistant/main.py`
 
-Your `main.py` is already complete from Step 1 — don't rewrite it. There are only **two functional additions**: import the tools, and pass them to the `Agent` via `tools=[...]`. Then extend TravelBuddy's instructions with one sentence so the model knows the tools exist.
+Your `main.py` is already complete from Step 2 — **don't rewrite it.** There's exactly **one functional addition**: append a `client.get_mcp_tool(...)` entry to the existing `tools=[...]` list. Then add one sentence to the instructions so the model knows when to reach for flight search.
 
-Add the import near the top, with the other imports:
+**Keep your Step 2 imports and function tools exactly as they are.** The three function tools are still registered; you're *adding* a fourth, remote tool alongside them:
 
 ```python
-# travel_assistant/main.py
-from tools import convert_currency, get_local_time, get_weather
-```
-
-Then update the `Agent(...)` call. **Keep your Step 1 instructions exactly as they are** and just append the two-line tools sentence, and add the `tools=[...]` argument:
-
-```python
-    agent = Agent(
-        client=client,
-        name="travel-buddy",
-        instructions=(
-            # ... keep your Step 1 instructions here ...
-            "Use your tools for weather, local time, and currency conversion "
-            "when the traveler asks time-sensitive questions. Keep answers brief."
+    tools = [
+        get_weather,        # <-- kept from Step 2
+        get_local_time,     # <-- kept from Step 2
+        convert_currency,   # <-- kept from Step 2
+        client.get_mcp_tool(                          # <-- add this entry
+            name=os.environ["MCP_SERVER_LABEL"],
+            url=os.environ["MCP_SERVER_URL"],
+            approval_mode="never_require",
         ),
-        tools=[get_weather, get_local_time, convert_currency],  # <-- add this line
-        default_options={"store": False},
-    )
+    ]
 ```
 
-That's the whole change: the `from tools import ...` line and the `tools=[...]` argument do the wiring; the appended instructions just tell the model when to reach for the tools. Everything else in `main.py` is unchanged from Step 1. If you get stuck, the finished file is in [`.workshop/solutions/02-tools/`](.workshop/solutions/02-tools/).
+Then **keep your Step 2 instructions exactly as they are** and append one MCP sentence so the model knows the flight-search capability exists:
 
-### 3. Update the metadata in `travel_assistant/agent.manifest.yaml`
+```python
+        instructions=(
+            # ... keep your Step 2 instructions here, unchanged ...
+            "Use the OctoTrip Flights MCP server when the traveler asks about "
+            "flights, routes, fares, or schedules; pass IATA airport codes and a "
+            "departure date (YYYY-MM-DD) — if the traveler doesn't give one, call "
+            "get_local_time and use the date part of its iso_time as today's date — "
+            "and summarize the options you find."
+        ),
+        tools=tools,        # <-- the list you just extended above
+```
 
-Local Python tools run inside your hosted-agent process, so the manifest **structure doesn't change** — same `template`, same `protocols`, and `resources` stays empty (`[]`) because no new Azure resource is needed. The edits are **metadata only**: update the human-facing `description`, add a `Function Tools` tag, and declare the three tools under `metadata.tool_declarations` so anyone browsing the agent can see what it can do.
+That's the whole code change. `client.get_mcp_tool(...)` reads the label and URL from the environment (the same values you just added to `.env`) and hands the agent a remote tool. Everything else in `main.py` — the `FoundryChatClient` setup, the three function tools, `default_options={"store": False}`, and `ResponsesHostServer(agent).run()` — is unchanged from Step 2. If you get stuck, the finished file is in [`.workshop/solutions/03-mcp/`](.workshop/solutions/03-mcp/).
+
+> **Why `os.environ[...]` and not a hardcoded URL?** Reading the label and URL from the environment keeps them out of source control and lets you point at a different MCP server (or the authenticated variant in Troubleshooting) by editing `.env` — no code change. The hosted runtime gets the same values from the manifest at deploy time.
+
+### 3. Update `travel_assistant/agent.manifest.yaml`
+
+An MCP connection is made **in code** and configured through **environment variables**, so the manifest structure barely changes — same `template`, same `protocols`, and `resources` stays empty (`[]`) because no new Azure resource is needed. This step makes two kinds of edit: **metadata** (update the human-facing `description`, add an `MCP Tools` tag and an MCP entry to `tool_declarations`) and **configuration** (add the two MCP environment variables so the hosted runtime receives them).
 
 Update the `description`:
 
 ```yaml
 # travel_assistant/agent.manifest.yaml
 description: >
-  TravelBuddy is an Agent Framework hosted agent with local Python function
-  tools for destination weather, local time, and currency conversion.
+  TravelBuddy is an Agent Framework hosted agent with local Python function tools
+  for weather, local time, and currency, plus an OctoTrip Flights MCP connection for
+  live flight search.
 ```
 
-Then extend `metadata` — add the new `Function Tools` tag and the `tool_declarations` block (`Travel Assistant` is already in the Step 1 tags):
+Extend `metadata` — add the `MCP Tools` tag and an MCP entry alongside the Step 2 `tool_declarations` (keep the three function-tool entries):
 
 ```yaml
 metadata:
@@ -245,34 +170,56 @@ metadata:
     - Azure AI AgentServer
     - Responses Protocol
     - Travel Assistant
-    - Function Tools     # <-- added
-  tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
-    - name: get_weather
-      description: Returns mock destination weather for a city and optional date.
-      parameters:
-        city: string
-        date: "string | null"
-    - name: get_local_time
-      description: Returns the current local time for a destination city.
-      parameters:
-        city: string
-    - name: convert_currency
-      description: Converts mock travel prices between USD, EUR, JPY, and GBP.
-      parameters:
-        amount: float
-        from_currency: string
-        to_currency: string
+    - Function Tools
+    - MCP Tools           # <-- added
+  tool_declarations:
+    # ... keep the get_weather / get_local_time / convert_currency entries ...
+    - name: octotrip-flights         # <-- added: the remote MCP tool group
+      description: OctoTrip Flights MCP server for live flight search.
+      type: mcp
+      url: ${MCP_SERVER_URL}
 ```
 
-`tool_declarations` is **descriptive metadata** — it documents the tools for humans and tooling that browse the manifest; the tools themselves are still registered in code via `tools=[...]` in `main.py`. Leave the `template` block, the `environment_variables`, and `resources: []` exactly as they were in Step 1. No new Azure resources are declared, so you won't need to re-provision — but because `azd ai agent init` **copied** your code and manifest into the project folder in Step 1, you will re-run `azd ai agent init` in the next section to refresh that copy with these changes before deploying.
+Then add the two MCP variables to the **existing** `template.environment_variables` list (keep the Step 1/Step 2 entries):
+
+```yaml
+template:
+  # ... name, kind, protocols unchanged ...
+  environment_variables:
+    # ... AZURE_AI_PROJECT_ENDPOINT, AZURE_AI_MODEL_DEPLOYMENT_NAME, WORKSHOP_RESOURCE_PREFIX ...
+    - name: MCP_SERVER_LABEL         # <-- added
+      value: ${MCP_SERVER_LABEL}
+    - name: MCP_SERVER_URL           # <-- added
+      value: ${MCP_SERVER_URL}
+
+resources: []                        # <-- unchanged: no new Azure resource
+```
+
+`tool_declarations` is **descriptive metadata** — it documents the agent's capabilities for humans and tooling that browse the manifest. The MCP tools are still connected in code via `client.get_mcp_tool(...)`; the MCP server itself decides which concrete tools it exposes at connect time. `resources` stays `[]` because MCP adds no Azure resource — the connection is an outbound HTTPS call from the running container.
+
+### 4. Add the MCP env vars to `travel_assistant/agent.yaml`
+
+`agent.yaml` is the local hosted-agent runtime definition, so it carries its **own** environment-variable list. Add the same two MCP variables here so the **local** run (`azd ai agent run`) picks them up — the hosted `agent.yaml` and the manifest's `template` share the same environment contract, but each file declares the variables it needs:
+
+```yaml
+# travel_assistant/agent.yaml
+environment_variables:
+  # ... AZURE_AI_PROJECT_ENDPOINT, AZURE_AI_MODEL_DEPLOYMENT_NAME, WORKSHOP_RESOURCE_PREFIX ...
+  - name: MCP_SERVER_LABEL           # <-- added
+    value: ${MCP_SERVER_LABEL}
+  - name: MCP_SERVER_URL             # <-- added
+    value: ${MCP_SERVER_URL}
+```
+
+Leave the `name`, `kind`, `protocols`, and CPU/memory blocks exactly as they were. No new Azure resource is declared, so you won't need to re-provision — but because `azd ai agent init` **copied** your code and manifest into the project folder in earlier steps, you'll re-run `azd ai agent init` in the next section to refresh that copy before deploying.
 
 ## Run and deploy TravelBuddy
 
-**Do you need to re-init? Yes.** In Step 1, `azd ai agent init` **copied** your `travel_assistant/` code into the generated `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder — that copy is the snapshot azd actually builds and deploys. Your Step 2 edits live in `travel_assistant/` (the new `tools.py` and the `main.py` changes), so the copied snapshot is now **stale**. Re-run `azd ai agent init` to refresh it before you run or deploy; it re-copies the current `travel_assistant/` code and re-reads the updated `agent.manifest.yaml`.
+**Do you need to re-init? Yes.** In the earlier steps, `azd ai agent init` **copied** your `travel_assistant/` code into the generated `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder — that copy is the snapshot azd actually builds and deploys. Your Step 3 edits live in `travel_assistant/` (the `main.py` MCP tool line, the appended instruction, and the manifest/`agent.yaml` changes), so the copied snapshot is now **stale**. Re-run `azd ai agent init` to refresh it before you run or deploy; it re-copies the current `travel_assistant/` code and re-reads the updated `agent.manifest.yaml`.
 
-You do **not** need `azd provision` again — you added no new Azure resources (`resources:` is still `[]`), so the infrastructure from Step 1 is unchanged. The re-init just refreshes the copied code + manifest, and then `azd deploy` ships the new container version.
+You do **not** need `azd provision` again — you added no new Azure resources (`resources:` is still `[]`), so the infrastructure from earlier steps is unchanged. The re-init just refreshes the copied code + manifest, and then `azd deploy` ships the new container version.
 
-> Prefer not to re-init? You can instead copy your edited files (`travel_assistant/tools.py` and `travel_assistant/main.py`) into the code directory inside `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` and skip straight to `azd deploy`. Re-init is the reliable path because it also picks up the manifest changes and can't drift out of sync.
+> Prefer not to re-init? You can instead copy your edited `travel_assistant/main.py` (and the updated YAML) into the code directory inside `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` and skip straight to `azd deploy`. Re-init is the reliable path because it also picks up the manifest changes and can't drift out of sync.
 
 1. **Re-init from the repository root.** Load your `.env` into the shell first — the repo `.env` isn't auto-loaded, and the shell needs `WORKSHOP_RESOURCE_PREFIX` to expand `--agent-name` (and to `cd` into the folder later):
 
@@ -295,26 +242,24 @@ You do **not** need `azd provision` again — you added no new Azure resources (
      --agent-name "$($env:WORKSHOP_RESOURCE_PREFIX)-travel-buddy"
    ```
 
-   This refreshes the `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` folder with your updated `main.py`, the new `tools.py`, and the updated manifest metadata.
+   This refreshes the `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` folder with your updated `main.py` and the updated manifest metadata (including the new MCP environment variables).
 
-2. **`cd` into the project folder and confirm the azd env values.** If the re-init reset the azd environment, re-set the three variables (they're idempotent, so it's safe to run them again). Keep `.env` loaded in the shell so you can pass the values through:
+2. **`cd` into the project folder and add the new MCP values to the azd env.** azd keeps its **own** environment store (`.azure/<env-name>/.env`), separate from the repo `.env`. The Foundry values (`AZURE_AI_PROJECT_ENDPOINT`, `AZURE_AI_MODEL_DEPLOYMENT_NAME`, `WORKSHOP_RESOURCE_PREFIX`) are already in the azd env from earlier steps, so you only need to set the **two new** MCP variables. Keep `.env` loaded in the shell so you can pass the values through:
 
    <!-- terminal -->
    ```bash
    # bash / zsh — after: set -a; source .env; set +a
    cd "${WORKSHOP_RESOURCE_PREFIX}-travel-buddy"
-   azd env set AZURE_AI_PROJECT_ENDPOINT "$AZURE_AI_PROJECT_ENDPOINT"
-   azd env set AZURE_AI_MODEL_DEPLOYMENT_NAME "$AZURE_AI_MODEL_DEPLOYMENT_NAME"
-   azd env set WORKSHOP_RESOURCE_PREFIX "$WORKSHOP_RESOURCE_PREFIX"
+   azd env set MCP_SERVER_LABEL "$MCP_SERVER_LABEL"
+   azd env set MCP_SERVER_URL "$MCP_SERVER_URL"
    ```
 
    <!-- terminal -->
    ```powershell
    # PowerShell — after loading .env into the shell
    cd "$($env:WORKSHOP_RESOURCE_PREFIX)-travel-buddy"
-   azd env set AZURE_AI_PROJECT_ENDPOINT "$env:AZURE_AI_PROJECT_ENDPOINT"
-   azd env set AZURE_AI_MODEL_DEPLOYMENT_NAME "$env:AZURE_AI_MODEL_DEPLOYMENT_NAME"
-   azd env set WORKSHOP_RESOURCE_PREFIX "$env:WORKSHOP_RESOURCE_PREFIX"
+   azd env set MCP_SERVER_LABEL "$env:MCP_SERVER_LABEL"
+   azd env set MCP_SERVER_URL "$env:MCP_SERVER_URL"
    ```
 
 3. **Run TravelBuddy locally** in the hosted Responses runtime:
@@ -324,18 +269,18 @@ You do **not** need `azd provision` again — you added no new Azure resources (
    azd ai agent run
    ```
 
-   `azd` reads `agent.yaml`, substitutes values from your azd environment, and starts the server on `http://localhost:8088` — now with your three tools loaded. Leave this terminal running.
+   `azd` reads `agent.yaml`, substitutes values from your azd environment, and starts the server on `http://localhost:8088` — now with your three function tools **and** the OctoTrip Flights MCP connection loaded. Leave this terminal running.
 
-4. **Invoke the local agent from a second terminal.** The `azd ai agent run` process is still holding the first terminal, so open a **new** one (in the same project folder) and send a prompt that needs live information, so the model has a reason to call a tool:
+4. **Invoke the local agent from a second terminal.** The `azd ai agent run` process is still holding the first terminal, so open a **new** one (in the same project folder) and ask a question that forces a flight search:
 
    <!-- terminal -->
    ```bash
-   azd ai agent invoke --local "What's the weather in Tokyo right now and what time is it there?"
+   azd ai agent invoke --local "Find flights from Seattle (SEA) to Tokyo (NRT). List a few options with airline, price, and times."
    ```
 
-   Expected: TravelBuddy calls `get_weather` and `get_local_time`, then combines both results into one natural-language answer.
+   Expected: TravelBuddy calls the OctoTrip Flights MCP server and answers with real flight options — not just generic advice. The exact flights and prices change as the live server updates.
 
-   Prefer a UI? With the local agent still running, open the **Agent Inspector** from the Foundry Toolkit (Command Palette → **Foundry Toolkit: Open Agent Inspector**). It connects to `http://localhost:8088` and shows each streamed tool call and result.
+   Prefer a UI? With the local agent still running, open the **Agent Inspector** from the Foundry Toolkit (Command Palette → **Foundry Toolkit: Open Agent Inspector**). It connects to `http://localhost:8088` and shows each streamed MCP tool call and result.
 
 5. **Deploy to Foundry**:
 
@@ -344,301 +289,131 @@ You do **not** need `azd provision` again — you added no new Azure resources (
    azd deploy
    ```
 
-   This builds the container image from the **refreshed** project-folder snapshot — now including `tools.py` and your updated `main.py` — pushes it to your Azure Container Registry, and rolls out a new hosted agent version. No `azd provision` is needed because the infrastructure is unchanged.
+   This builds the container image from the **refreshed** project-folder snapshot — now including the MCP tool registration and env vars — pushes it to your Azure Container Registry, and rolls out a new hosted agent version. No `azd provision` is needed because the infrastructure is unchanged.
 
 6. **Invoke the deployed agent**:
 
    <!-- terminal -->
    ```bash
-   azd ai agent invoke "What's the weather in Tokyo right now and what time is it there?"
+   azd ai agent invoke "Find flights from Seattle (SEA) to Tokyo (NRT)."
    ```
 
-   Prefer a UI? Open the **Hosted Agent Playground** from the Foundry Toolkit (**Developer Tools** → **Build** → **Hosted Agent Playground**), pick your deployed agent and version, and watch the tool calls in the session details.
+   Prefer a UI? Open the **Hosted Agent Playground** from the Foundry Toolkit (**Developer Tools** → **Build** → **Hosted Agent Playground**), pick your deployed agent and version, and watch the MCP tool calls in the session details.
 
 ## Try it
 
-- "What's the weather in Tokyo right now and what time is it there?"
-- "If a hotel costs 28,000 JPY, how much is that in EUR?"
-- "Compare current weather in Lisbon, Reykjavik, and Tokyo."
+Try prompts that make the tool choice obvious.
 
-For the comparison prompt, the model may call `get_weather` once per city.
+- "Find me flights from London (LHR) to New York (JFK)."
+
+Now try a **mixed** prompt that should use both a local function tool and MCP in one conversation:
+
+- "What's the weather in Reykjavik right now, and can you find flights from Reykjavik (KEF) to Copenhagen (CPH)?"
+
+The weather portion should use the Step 2 `get_weather` function tool; the flight portion should use OctoTrip Flights MCP. That's the key lesson: local function tools and remote MCP tools are both just tools from the model's point of view, and it routes each part of the question to the right one.
 
 ## Troubleshooting
 
-- **Tools never get called**: the model decides whether to call them. Make sure your docstring is descriptive (the model reads it). Try a prompt that explicitly needs real-time info.
-- **`Function signature mismatch`**: the Agent Framework needs JSON-serialisable types. Use `str`, `int`, `float`, `bool`, `dict`, `list` — not custom classes.
-- **`Schema generation failed`**: missing type hint on a parameter. Add `: type` for every arg.
-- **`ModuleNotFoundError: tools`**: run from the repository root with `python travel_assistant/main.py`, or use `azd ai agent run` from the project folder.
-- **Unknown city time zones**: add the city to `CITY_TIME_ZONES`, or let the mock fall back to UTC.
-- **Currency values look approximate**: they are static mock rates. Replace `MOCK_RATES_TO_USD` with a real exchange-rate API for production.
-- **Deploy didn't pick up my tools**: `azd ai agent init` **copied** your code into the `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder, so edits in `travel_assistant/` don't deploy on their own. Re-run `azd ai agent init` (step 1 above) to refresh that snapshot — or copy `tools.py`/`main.py` into the folder's code directory — then `azd deploy` again.
+### MCP server unreachable
 
-## Optional: Observe TravelBuddy's tool calls with Application Insights
+Check the URL in `.env`.
 
-You just gave TravelBuddy three tools — wouldn't it be nice to *watch* each one fire: which tool the model chose, with what arguments, how long it took, and how many tokens the run cost? Foundry hosted agents have **built-in observability**. The Agent Framework is instrumented out of the box, and the Foundry hosting runtime exports those traces to **Application Insights** for you. There's **no code to write, no package to add, and no manifest change** — your `resources: []` stays exactly as it is. You connect an Application Insights resource **with managed-identity authentication** — the connection string stops being a credential — grant a few least-privilege roles, and the traces appear.
+```env
+# .env
+MCP_SERVER_URL=https://mcp.octotrip.app/flights/mcp
+```
 
-Each invocation becomes a span tree you can drill into:
+The OctoTrip Flights MCP is public and anonymous, but it's rate-limited (roughly one request per second). If calls fail intermittently, space out your prompts and retry. If the endpoint is temporarily unavailable, try again later — or switch to the mock below.
 
-- `invoke_agent` — the top-level span for one request to TravelBuddy.
-- `chat` — each model call inside that request.
-- `execute_tool` — one span per tool the model runs, so `get_weather`, `get_local_time`, and `convert_currency` each show up **by name**, with their arguments and results.
+### Use the mock when OctoTrip is unavailable
 
-> This is entirely optional and needs a **deployed** agent — traces flow from the hosted runtime, not from `python main.py`. Skip it if you just want to finish the core step.
->
-> You'll also need enough Azure rights for the setup below — the baseline **Foundry User** role isn't enough on its own:
->
-> - **create a connection on the Foundry project** (`Microsoft.CognitiveServices/accounts/projects/connections/write`),
-> - **create an Application Insights resource** and read it (plus `Microsoft.OperationalInsights/workspaces/write` if the wizard also creates the linked workspace),
-> - **change the Application Insights resource's settings** (`Microsoft.Insights/components/write`, to disable local authentication), and
-> - **assign roles** (`Microsoft.Authorization/roleAssignments/write`) on it and its Log Analytics workspace.
->
-> If you can't, ask an administrator to make the scoped assignments below — none of them needs subscription-level Owner.
+This repo ships a stand-in that speaks the same MCP protocol and exposes the same `search` tool, but **generates every offer from your request** instead of calling a live service: [`.workshop/mocks/octotrip_flights_mcp/`](.workshop/mocks/octotrip_flights_mcp/). Real airport coordinates give it believable durations, connections, and local arrival times, and the same request always returns the same offers — handy for a demo. Nothing it returns is real: the airlines are invented and every payload is marked `"mock": true`.
 
-### 1. Connect Application Insights to your project (keyless)
+Run it locally with no dependencies:
 
-Foundry turns on **server-side tracing** the moment you connect an Application Insights resource — no code, and traces appear within minutes.
+```bash
+make mock-mcp   # or: python .workshop/mocks/octotrip_flights_mcp/serve_local.py
+```
 
-1. Open your project in the [Microsoft Foundry portal](https://ai.azure.com/) (make sure **New Foundry** is on).
-2. In the left navigation select **Agents**, then the **Traces** tab at the top.
-3. Select **Connect**, then either pick an existing Application Insights resource or choose **Create new**.
-4. **Before** you finish the wizard, set **Auth type** to **Project Managed Identity** — *not* the connection string. The wizard defaults to connection-string auth, so changing it afterwards means an extra conversion step. Foundry then ingests traces with the project's managed identity instead of a key.
-5. Complete the wizard and select **Create**. A confirmation appears when the connection succeeds.
+That's enough for any MCP client on your machine, but **not** for your agent: `client.get_mcp_tool(...)` registers a *hosted* MCP tool, so Foundry calls the URL from its own network and never reaches your `localhost`. Give it a public URL instead.
 
-> **Prefer a dedicated resource.** Later in this section you'll disable local (key-based) authentication on the Application Insights resource, which applies **resource-wide** — any other app still publishing with an instrumentation key or connection string stops being able to write to it. Creating a fresh `${WORKSHOP_RESOURCE_PREFIX}-appinsights` keeps that blast radius to your own workshop. If you must reuse an existing shared resource, confirm every publisher already authenticates with Entra ID first.
+The quick way, and the usual inner-loop pattern — keep the server local, tunnel it out with the [dev tunnel CLI](https://learn.microsoft.com/azure/developer/dev-tunnels/get-started):
 
-> **Already connected with a connection string?** Convert it in place: project name menu → **Project details** → **Connected resources** → select the Application Insights connection → **Edit authentication** → **Project managed identity** → **Save**.
+```bash
+devtunnel user login
+devtunnel host --port-number 8931 --allow-anonymous
+```
 
-> **Name it, then clean it up yourself.** If you create a new resource, prefix its name with your `WORKSHOP_RESOURCE_PREFIX` (for example `${WORKSHOP_RESOURCE_PREFIX}-appinsights`) so it's easy to spot later. Application Insights is created *out-of-band* — it isn't in the manifest, so **neither `azd down` nor `.workshop/scripts/cleanup.py` removes it**. Delete it (and any Log Analytics workspace the wizard created alongside it) when you're done, for example `az resource delete --ids <app-insights-resource-id>`.
+`--allow-anonymous` is required — Foundry sends no tunnel token, and a protected tunnel just answers 401. Don't name the tunnel: `devtunnel create <id>` needs a **globally unique** ID, so a shared name fails for everyone after the first person. `devtunnel host` prints the public URL; keep it running while you work. In a Codespace, forwarding port 8931 as **Public** does the same job.
 
-Note the resource ID — every command below reuses it. **Re-run this in each new terminal**, because an unset scope is the one mistake that really bites: `az role assignment create --scope ""` doesn't fail, it silently falls back to **subscription scope** and grants far more than you intended. Each block below guards against that.
+For something that outlives your terminal, deploy it: the same folder is an Azure Functions app with anonymous access, and its [README](.workshop/mocks/octotrip_flights_mcp/README.md) has the `az` commands.
+
+Either way, append `/mcp` to the URL. Only `MCP_SERVER_URL` changes — leave `MCP_SERVER_LABEL` alone — and set it in both places, `.env` and the azd environment:
+
+```env
+# .env
+MCP_SERVER_URL=https://<generated-id>-8931.<region>.devtunnels.ms/mcp
+```
 
 <!-- terminal -->
 ```bash
-export APP_INSIGHTS="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"
+cd "${WORKSHOP_RESOURCE_PREFIX}-travel-buddy"
+azd env set MCP_SERVER_URL "$MCP_SERVER_URL"
 ```
 
-<!-- terminal -->
-```powershell
-$env:APP_INSIGHTS = "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"
+Skipping the `azd env set` is the usual reason the agent keeps calling the real server: `azd` reads its own environment, not the repo's `.env`. Restart `azd ai agent run` afterwards. A temporary tunnel gets a new URL each time you host it, so redo that command whenever you restart it.
+
+> **`--allow-anonymous` is safe for this mock only.** It publishes an endpoint that authenticates nobody, which is fine here because the mock holds no data, has no managed identity, and invents every answer — there is nothing for a stranger to read or borrow. Don't reuse the flag for a server that fronts real data. In [Step 5](.workshop/docs/steps/05-rag.md) your Search MCP holds `Search Index Data Reader` over your destinations index; exposing *that* anonymously would publish read access to every document in it, to anyone with the URL, with no sign-in and no audit trail. A retrieval endpoint authenticates its callers with Entra ID — tunnelled or deployed.
+
+Switch back to `https://mcp.octotrip.app/flights/mcp` once the real server answers again.
+
+### No MCP tools listed
+
+Confirm the two settings are in **both** `.env` and the manifest, and that `main.py` actually appends `client.get_mcp_tool(...)` to the `tools` list passed to `Agent`.
+
+Common mistakes:
+
+- putting `environment_variables` under `resources` instead of `template`;
+- using `environmentVariables` instead of `environment_variables`;
+- adding `MCP_SERVER_LABEL` / `MCP_SERVER_URL` to `.env` but not to the manifest;
+- forgetting to restart the agent (or re-run `azd ai agent init`) after editing `.env` or the manifest.
+
+### The local function tools stopped working
+
+The final `tools` list should contain **four** entries: the three function tools from Step 2 (`get_weather`, `get_local_time`, `convert_currency`) plus the MCP tool from this step. If you replaced the whole list with only the MCP tool, restore the function tools and run again.
+
+### Auth error against the MCP server
+
+OctoTrip Flights MCP is anonymous, so an auth error usually means you changed `MCP_SERVER_URL` to a server that requires a token. For an authenticated MCP server, follow the upstream `03-mcp` auth pattern: read a token from the environment and pass an `Authorization` header to `client.get_mcp_tool(...)`.
+
+```python
+# travel_assistant/main.py
+token = os.environ["MCP_SERVER_TOKEN"]
+mcp_tool = client.get_mcp_tool(
+    name=os.environ["MCP_SERVER_LABEL"],
+    url=os.environ["MCP_SERVER_URL"],
+    headers={"Authorization": f"Bearer {token}"},
+    approval_mode="never_require",
+)
 ```
 
-### 2. Let both writing identities emit traces
+Do not commit tokens to `.env.example`, `agent.manifest.yaml`, or source control. Use your local `.env` or the deployment environment's secret store.
 
-A hosted agent emits telemetry from **two** identities, and each needs **Monitoring Metrics Publisher** on the Application Insights resource:
+### The agent answers without searching flights
 
-- the **project managed identity** emits the server-side spans. When you *create* the connection with **Project Managed Identity**, the portal assigns this role for you — but the **Edit authentication** conversion path doesn't always, so assign it explicitly below rather than assume.
-- the **agent's instance identity** emits everything your code produces inside the sandbox. It **never** gets this role automatically.
+Make the prompt explicit: give an origin, a destination (IATA codes work well), and a departure date, and ask for flight options. MCP gives the model access to live flight search, but the model still chooses whether to call it. Strong prompts make the desired tool use clear while you're testing.
 
-**Grant the project managed identity.** Copy its **Object (principal) ID** from the project's **Identity** page in the portal (assigning an existing role again is harmless):
+### Deploy didn't pick up my MCP change
 
-<!-- terminal -->
-```bash
-: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope}"
-PROJECT_MI_ID="<project-managed-identity-object-id>"   # from the project's Identity page
-
-az role assignment create \
-  --assignee-object-id "$PROJECT_MI_ID" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Monitoring Metrics Publisher" \
-  --scope "$APP_INSIGHTS"
-```
-
-<!-- terminal -->
-```powershell
-if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope" }
-$PROJECT_MI_ID = "<project-managed-identity-object-id>"   # from the project's Identity page
-
-az role assignment create `
-  --assignee-object-id $PROJECT_MI_ID `
-  --assignee-principal-type ServicePrincipal `
-  --role "Monitoring Metrics Publisher" `
-  --scope $env:APP_INSIGHTS
-```
-
-**Grant the agent's instance identity** the same least-privilege role:
-
-<!-- terminal -->
-```bash
-# Load your .env values first if this is a fresh shell: set -a; source .env; set +a
-: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope}"
-: "${WORKSHOP_RESOURCE_PREFIX:?Set WORKSHOP_RESOURCE_PREFIX (from your .env)}"
-: "${AZURE_AI_PROJECT_ENDPOINT:?Set AZURE_AI_PROJECT_ENDPOINT (from your .env)}"
-AGENT_NAME="${WORKSHOP_RESOURCE_PREFIX}-travel-buddy"
-
-# 1. Resolve the agent's instance identity principal ID.
-AGENT_IDENTITY="$(az rest --method GET \
-  --url "${AZURE_AI_PROJECT_ENDPOINT}/agents/${AGENT_NAME}?api-version=v1" \
-  --resource "https://ai.azure.com" \
-  --query "instance_identity.principal_id" -o tsv)"
-: "${AGENT_IDENTITY:?Could not resolve the agent's instance identity — is the agent deployed?}"
-
-# 2. Let it write telemetry to the Application Insights resource from step 1.
-az role assignment create \
-  --assignee-object-id "$AGENT_IDENTITY" \
-  --assignee-principal-type ServicePrincipal \
-  --role "Monitoring Metrics Publisher" \
-  --scope "$APP_INSIGHTS"
-```
-
-<!-- terminal -->
-```powershell
-# Set these from your .env values if this is a fresh shell.
-if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope" }
-if (-not $env:WORKSHOP_RESOURCE_PREFIX) { throw "Set WORKSHOP_RESOURCE_PREFIX (from your .env)" }
-if (-not $env:AZURE_AI_PROJECT_ENDPOINT) { throw "Set AZURE_AI_PROJECT_ENDPOINT (from your .env)" }
-$AGENT_NAME = "${env:WORKSHOP_RESOURCE_PREFIX}-travel-buddy"
-
-# 1. Resolve the agent's instance identity principal ID.
-$AGENT_IDENTITY = az rest --method GET `
-  --url "${env:AZURE_AI_PROJECT_ENDPOINT}/agents/${AGENT_NAME}?api-version=v1" `
-  --resource "https://ai.azure.com" `
-  --query "instance_identity.principal_id" -o tsv
-if (-not $AGENT_IDENTITY) { throw "Could not resolve the agent's instance identity — is the agent deployed?" }
-
-# 2. Let it write telemetry to the Application Insights resource from step 1.
-az role assignment create `
-  --assignee-object-id $AGENT_IDENTITY `
-  --assignee-principal-type ServicePrincipal `
-  --role "Monitoring Metrics Publisher" `
-  --scope $env:APP_INSIGHTS
-```
-
-> Like every other agent-identity grant in this workshop, this one belongs to the **agent**, not to an agent *version* — it survives `azd deploy`. See [Configure Microsoft Entra authentication for trace ingestion](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-ingestion-entra-authentication).
-
-**Now enforce keyless ingestion.** Both writers can authenticate with Entra ID, so it's safe to turn off key-based ingestion. Wait a few minutes for the role assignments to propagate first — flipping this switch before they land makes *every* export fail with `Forbidden`:
-
-<!-- terminal -->
-```bash
-: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1)}"
-az resource update --ids "$APP_INSIGHTS" --set properties.DisableLocalAuth=true
-```
-
-<!-- terminal -->
-```powershell
-if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1)" }
-az resource update --ids $env:APP_INSIGHTS --set properties.DisableLocalAuth=true
-```
-
-Ingestion is now **keyless**: the connection string still identifies *where* telemetry goes, but its instrumentation key no longer authorizes anything. Only Entra ID identities holding the role above can write. That's the same keyless posture as every other resource in this workshop.
-
-> **Reversible.** This setting applies to the whole Application Insights resource, so anything still publishing with an instrumentation key stops being able to write. Roll it back with the same command and `properties.DisableLocalAuth=false`.
-
-### 3. Grant yourself access to view the traces
-
-Your Foundry project access alone isn't enough: **Foundry User** sees metrics but **not** traces. Grant yourself the least-privilege **Monitoring Reader** role, scoped to the Application Insights resource. Its `*/read` permission reaches the underlying Log Analytics data, so you don't need a separate workspace grant.
-
-<!-- terminal -->
-```bash
-# APP_INSIGHTS is the resource ID you set in step 1.
-: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope}"
-USER_ID="$(az ad signed-in-user show --query id -o tsv)"
-az role assignment create --assignee "$USER_ID" --role "Monitoring Reader" --scope "$APP_INSIGHTS"
-```
-
-<!-- terminal -->
-```powershell
-# PowerShell — $env:APP_INSIGHTS is the resource ID you set in step 1.
-if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope" }
-$USER_ID = az ad signed-in-user show --query id -o tsv
-az role assignment create --assignee $USER_ID --role "Monitoring Reader" --scope $env:APP_INSIGHTS
-```
-
-Prefer the portal? On the Application Insights resource open **Access control (IAM)** → **Add role assignment** → **Monitoring Reader** → assign it to yourself. (Working straight from the Log Analytics workspace instead? **Log Analytics Reader** at the workspace scope also works.)
-
-### 4. Let the project read telemetry back (for evaluations)
-
-If you plan to use Foundry's **evaluations** feature — which reads your agent's telemetry back out of Application Insights — the **project's managed identity** needs read access to those traces. The trace data physically lives in the **Log Analytics workspace** behind Application Insights, so grant the **Log Analytics Reader** role at **both** scopes: the **Application Insights** resource *and* its **linked Log Analytics workspace**. That two-scope grant is what Microsoft's trace-evaluation guidance prescribes; a single-scope grant can leave evaluations unable to read the traces. Just *viewing* traces in step 5 doesn't need this grant — it's specifically for the project reading telemetry on your behalf.
-
-Assign **Log Analytics Reader** to the project's managed identity on **each** of these two resources (the project identity is selectable by name):
-
-- the **Application Insights** resource you connected in step 1, and
-- the **Log Analytics workspace** it's linked to (from Application Insights, open **Overview** and follow the **Workspace** link).
-
-For each resource: **Access control (IAM)** → **Add role assignment** → role **Log Analytics Reader** (**Job function roles** tab) → Members **Managed identity** → your **Foundry project** → **Review + assign**.
-
-> **Why the project and not the agent?** *Writing* traces involves both identities (step 2), but *reading* telemetry back for evaluations is a **project** operation: Foundry queries Application Insights as the project's **managed identity**, never as the agent's. So this grant goes to the project identity only.
-
-Prefer the CLI? Copy the project's managed-identity **Object (principal) ID** from the project's **Identity** page in the portal, then assign the role at **both** scopes:
-
-<!-- terminal -->
-```bash
-PROJECT_MI_ID="<project-managed-identity-object-id>"   # from the project's Identity page
-APP_INSIGHTS="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"   # same as step 1
-WORKSPACE="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace-name>"
-
-# Grant Log Analytics Reader at BOTH scopes: the App Insights resource and its linked workspace.
-for SCOPE in "$APP_INSIGHTS" "$WORKSPACE"; do
-  : "${SCOPE:?Both resource IDs must be set — an empty scope would grant at subscription scope}"
-  az role assignment create \
-    --assignee-object-id "$PROJECT_MI_ID" \
-    --assignee-principal-type ServicePrincipal \
-    --role "Log Analytics Reader" \
-    --scope "$SCOPE"
-done
-```
-
-<!-- terminal -->
-```powershell
-# PowerShell
-$PROJECT_MI_ID = "<project-managed-identity-object-id>"   # from the project's Identity page
-$APP_INSIGHTS = "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"   # same as step 1
-$WORKSPACE = "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace-name>"
-
-# Grant Log Analytics Reader at BOTH scopes: the App Insights resource and its linked workspace.
-foreach ($SCOPE in @($APP_INSIGHTS, $WORKSPACE)) {
-  if (-not $SCOPE) { throw "Both resource IDs must be set — an empty scope would grant at subscription scope" }
-  az role assignment create `
-    --assignee-object-id $PROJECT_MI_ID `
-    --assignee-principal-type ServicePrincipal `
-    --role "Log Analytics Reader" `
-    --scope $SCOPE
-}
-```
-
-> **Why `--assignee-object-id` and not `--assignee`?** The plain `--assignee` flag makes the CLI resolve the identity through Microsoft Graph, which often fails for a project managed identity (*"Cannot find user or service principal in graph database"*). Passing the object ID with `--assignee-principal-type ServicePrincipal` writes straight to Azure Resource Manager and skips that lookup.
-
-> **Evaluations still find no traces?** If your Log Analytics tables are set to a **Protected** access level, Log Analytics Reader can't read them — also assign **Privileged Monitoring Data Reader** to the project identity at the same two scopes.
-
-### 5. Generate traffic, then read the traces
-
-> **Heads up — traces capture prompt and tool content by default.** When deployed, the hosting runtime defaults `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `true`, so the spans you're about to generate include prompts, tool arguments, and model responses. That's great for debugging — and it's what content-based **evaluations** (step 4) read — but treat traces as **sensitive production data** and apply the same access controls you'd give logs. To record only structure (span names, durations, token counts, status) and redact content, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `"false"` under `template.environment_variables` in `travel_assistant/agent.manifest.yaml` (and `agent.yaml`'s `environment_variables` for local runs), then **re-run `azd ai agent init` to refresh the deployed snapshot** (see the deploy section above) and `azd deploy`. Redacting content disables content-based quality evaluators, so keep it on only while you need evaluations. Either way, never put secrets in prompts or tool arguments.
-
-1. Make sure TravelBuddy is deployed — see **item 5 of [Run and deploy TravelBuddy](#run-and-deploy-travelbuddy)** earlier in this step. Already deployed before you connected Application Insights? No redeploy needed — tracing is enabled at the project level.
-2. Invoke it a few times to produce spans — reuse the [Try it](#try-it) prompts:
-
-   <!-- terminal -->
-   ```bash
-   azd ai agent invoke "Compare current weather in Lisbon, Reykjavik, and Tokyo."
-   ```
-
-3. In the Foundry portal open **Agents → Traces**, wait a minute, and refresh. Select a trace to step through the `invoke_agent` → `chat` → `execute_tool` spans and watch each tool call, its arguments, and its result. The same data also lands in the connected Application Insights resource, so you can query it in **Transaction search** or with KQL.
-
-> **`Forbidden`, `The Agent/SDK does not have permissions to send telemetry to this resource`, or live-metrics publish errors?** Ingestion is enforcing Entra ID but the exporting identity has no **Monitoring Metrics Publisher** role. Confirm **both** identities from step 2 hold it on the Application Insights resource — the project managed identity *and* the agent's instance identity. The agent identity is the one people miss, and it's the one that fails after `azd deploy`:
->
-> <!-- terminal -->
-> ```bash
-> : "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would query the wrong resource}"
-> az role assignment list --scope "$APP_INSIGHTS" \
->   --query "[?roleDefinitionName=='Monitoring Metrics Publisher'].principalId" -o tsv
-> ```
->
-> Expect **two** principal IDs — the project managed identity and the agent's instance identity. Role assignments take a few minutes to propagate. If you disabled local authentication before the grants landed, that's the whole cause — the assignments fix it, no redeploy needed.
-
-**References:**
-
-- [Set up tracing in Microsoft Foundry](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-agent-setup) — connect Application Insights and view traces (no code changes required).
-- [Configure Microsoft Entra authentication for trace ingestion (preview)](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-ingestion-entra-authentication) — the keyless ingestion path used above: **Auth type = Project Managed Identity**, local authentication disabled, and **Monitoring Metrics Publisher** for the *agent* identity so sandbox code can emit traces too.
-- [Troubleshoot evaluation and observability issues](https://learn.microsoft.com/azure/foundry/observability/how-to/troubleshooting#project-managed-identity-is-missing-trace-read-permissions) — the exact grant the project's managed identity needs to read traces for evaluations: **Log Analytics Reader on both the Application Insights resource and its linked Log Analytics workspace** (plus Privileged Monitoring Data Reader if the tables are protected).
-- [Hosted agent permissions — Agent observability](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agent-permissions#agent-observability) — Microsoft's least-privilege roles for **viewing** telemetry, and the source of the **Monitoring Reader** guidance above (its `*/read` reaches the underlying Log Analytics data without a separate workspace grant).
-- [Observability in the Agent Framework](https://learn.microsoft.com/agent-framework/agents/observability) — the built-in GenAI instrumentation and the `invoke_agent` / `chat` / `execute_tool` spans.
+`azd ai agent init` **copied** your code into the `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder, so edits in `travel_assistant/` don't deploy on their own. Re-run `azd ai agent init` (step 1 above) to refresh that snapshot — or copy your edited files into the folder's code directory — then `azd deploy` again.
 
 ## Solution
 
-> If you get stuck: [`.workshop/solutions/02-tools/`](.workshop/solutions/02-tools/)
+> If you get stuck: [`.workshop/solutions/03-mcp/`](.workshop/solutions/03-mcp/)
 
 ## Upstream sample
 
-> Based on the upstream [`02-tools`](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/02-tools) sample.
+> Based on the upstream [`03-mcp`](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/03-mcp) sample.
 
 
 ---
@@ -648,13 +423,13 @@ foreach ($SCOPE in @($APP_INSIGHTS, $WORKSPACE)) {
 
 ## ✅ Done with this step? Push to advance.
 
-**Next:** Step 03 — MCP integration
+**Next:** Step 04 — Foundry Toolbox
 
-Commit the files you created or edited in this step and push them to `main`. The push automatically loads Step 03 — there is no button to click.
+Commit the files you created or edited in this step and push them to `main`. The push automatically loads Step 04 — there is no button to click.
 
 ```bash
 git add -A
-git commit -m "Complete step 2"
+git commit -m "Complete step 3"
 git push
 ```
 
@@ -662,7 +437,7 @@ After the **Advance workshop on push to main** Action finishes, run **`git pull`
 
 > Each push to `main` advances the workshop by exactly **one** step, so push once — when this step is done.
 
-> **Prefer to stay local?** Run `python .workshop/scripts/advance_step.py --expected-current-step 2 --auto-commit` (or `make advance`) instead. That advances locally and records it in the same commit, so your next push won't advance again. See [Working fully locally](.workshop/docs/steps/00-intro.md#5-working-fully-locally-no-github-actions).
+> **Prefer to stay local?** Run `python .workshop/scripts/advance_step.py --expected-current-step 3 --auto-commit` (or `make advance`) instead. That advances locally and records it in the same commit, so your next push won't advance again. See [Working fully locally](.workshop/docs/steps/00-intro.md#5-working-fully-locally-no-github-actions).
 
 <sub>Made a mistake on this step? Re-lay its clean starter files with the [Reset current step](https://github.com/AdityaPadhy/ai-workshop-project/actions/workflows/reset-current-step.yml) workflow, or run `python .workshop/scripts/advance_step.py --reset-current --auto-commit` locally — you stay on this step. To start the whole workshop over instead, use [Reset workshop](https://github.com/AdityaPadhy/ai-workshop-project/actions/workflows/reset-workshop.yml) or `python .workshop/scripts/advance_step.py --reset --auto-commit`.</sub>
 
