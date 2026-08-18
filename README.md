@@ -2,17 +2,17 @@
 
 Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses).
 
-> **Progress:** Step `01` of `9` — **Basic hosted agent**  
-> ▰▱▱▱▱▱▱▱▱▱
+> **Progress:** Step `02` of `9` — **Function tools**  
+> ▰▰▱▱▱▱▱▱▱▱
 
-<!-- step: 01 -->
+<!-- step: 02 -->
 
 <details>
 <summary>Workshop map</summary>
 
 - Step 00 — Setup ✅
-- **Step 01 — Basic hosted agent**
-- Step 02 — Function tools
+- Step 01 — Basic hosted agent ✅
+- **Step 02 — Function tools**
 - Step 03 — MCP integration
 - Step 04 — Foundry Toolbox
 - Step 05 — RAG (Azure AI Search)
@@ -27,158 +27,254 @@ Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/fou
 If something looks broken see [Troubleshooting](.workshop/docs/steps/00-intro.md#troubleshooting).
 
 
-# Step 1 — Your first hosted agent: TravelBuddy
+# Step 2 — Give TravelBuddy real-time tools
 
-> **Goal:** stand up a hosted Foundry agent that can hold a basic travel conversation.
+> **Goal:** wire three function tools — weather, local time, currency conversion — into the agent so it can answer time-sensitive questions.
 
 ## What you'll learn
 
-- What a Foundry **hosted agent** is and how the Agent Framework talks to it
-- How `DefaultAzureCredential` flows from `az login` to the agent client
-- The minimum agent.yaml / agent.manifest.yaml needed to ship an agent
+- How the Agent Framework turns a plain Python function into a tool the model can call
+- How the tool's JSON schema is inferred from your type hints + docstring
+- The full request → tool-call → result → final-answer loop, and who decides when a tool runs
+- Why adding local tools changes your code but **not** your deployment shape
 
 ## What's already in the repo
 
-- `travel_assistant/requirements.txt` — the Python packages for the Step 1 agent.
-- `travel_assistant/agent.yaml` — the hosted-agent runtime definition. It's ready to run; you'll read it to understand each part.
-- `travel_assistant/agent.manifest.yaml` — the deployment/template manifest. It's provided complete; you'll read it to see what it declares.
-- `travel_assistant/main.py` — the Python entry point. You'll write TravelBuddy's instructions.
-- `travel_assistant/Dockerfile` — how your agent is packaged into the container image Foundry runs. Provided complete; you'll read it.
-- `travel_assistant/.dockerignore` — keeps build junk and local secrets (`.env`) out of that image.
-- `travel_assistant/.azdignore` — tells `azd` which files *not* to upload when it packages the deployment.
+- `travel_assistant/main.py`, `agent.yaml`, `agent.manifest.yaml` — carried over from Step 1 (your TravelBuddy chat agent). Nothing was deleted when you advanced; your Step 1 work is preserved.
+- `travel_assistant/tools.py` — a **stub** laid down for this step with a single `TODO`. You'll implement the three tool functions here.
 
-In this step you **complete** the one small edit called out below (TravelBuddy's instructions in `main.py`) — you don't create the files from scratch, and the two YAML files are ready to use as-is. The workshop is **incremental**: when you advance, the next step's files are laid on top of your `travel_assistant/` folder. Files from earlier steps that the next step doesn't touch stay exactly as they are — nothing is deleted. Files the next step ships (for example an updated `main.py`) are refreshed to that step's version, and your current work is backed up under `.workshop_instance/workshop_backups/step-<N>/` first, so you can always recover your own wording.
-
-> **Before you start:** make sure you completed the setup in Step 0 — [Install the tools you'll need](.workshop/docs/steps/00-intro.md#install-the-tools-youll-need) and [Set up your local environment](.workshop/docs/steps/00-intro.md#set-up-your-local-environment-one-time). If `python .workshop/scripts/preflight.py --step 1` is green, you're ready.
+In this step you **implement** `tools.py`, then make two small edits to `main.py` (one import + one argument) and one edit to the manifest's description. You do **not** rewrite `main.py` from scratch — you add to the file you finished in Step 1.
 
 ## Concept (5-min read)
 
-**Azure AI Foundry** (the Learn docs now call the new experience **Microsoft Foundry**) is the Azure platform for building, deploying, and managing AI apps and agents. It gives you a portal, SDKs, model catalog, model deployments, agent tooling, tracing, evaluation, and access controls in one place, instead of making every app assemble those pieces by hand.
+TravelBuddy can already hold a conversation, but a chat model only knows what it was trained on. It cannot know **today's** weather in Tokyo, the **current** time in Lisbon, or a **fresh** currency estimate. To answer those questions it needs a way to ask running code for live information — that's what **function tools** are for.
 
-A **Foundry project** is the workspace boundary for one app, prototype, or team. It holds the things your code needs at runtime: model deployments, connections, files, evaluations, and hosted agents. The `AZURE_AI_PROJECT_ENDPOINT` value in your `.env` points to exactly one project, usually in this shape:
+A **function tool** is just an ordinary Python function you hand to the agent. In the Agent Framework you register one by passing it in the `tools=[...]` list when you create the `Agent`. The framework then reads the function's **type hints** and **docstring** and builds a JSON schema describing the tool's name, parameters, and purpose. That schema — not your Python source — is what the model sees.
 
-```text
-https://<foundry-resource>.services.ai.azure.com/api/projects/<project-name>
-```
+In OpenAI-Responses-style tool calling, the model never runs your Python directly. Instead the loop looks like this:
 
-In this workshop, TravelBuddy uses that endpoint plus `AZURE_AI_MODEL_DEPLOYMENT_NAME` to find the model deployment inside your project.
+1. The model reads the user's message and the tool schemas.
+2. If it decides a tool would help, it emits a structured **tool call** with JSON arguments (for example `get_weather(city="Tokyo")`).
+3. The Agent Framework matches that call to your Python function, runs it, and captures the return value.
+4. The result is fed back to the model, which then writes the final natural-language answer for the user.
 
-A **raw model call** sends a prompt directly to a model deployment and gets one response back. That is useful, but the caller must know all of the app wiring: which model to use, what instructions to send, how to manage conversation state, where tools live, and how to deploy the code.
+The framework hides all of that plumbing — the request/response threading, argument parsing, and result formatting. Your job is to write clear functions. Because the **model** decides when to call a tool, good function names, complete type hints, and descriptive docstrings matter: the docstring is effectively the model's instruction manual for the tool.
 
-A **Foundry hosted agent** is different: it is an agent application packaged as a **container image** and deployed **into your Foundry project**, where Foundry runs it for you as a managed service. The package tells Foundry how to start the agent, which protocol it serves, which environment variables it needs, and what resources it should get. In Step 1 the agent only chats; in later steps the same hosted boundary becomes the place where TravelBuddy gains tools, retrieval, workflows, and memory.
+Each tool in this step is decorated with `@tool(approval_mode="never_require")`. The `@tool` decorator marks the function as a callable tool and lets you configure its behavior; `approval_mode="never_require"` tells the runtime to run it automatically without pausing for human approval — appropriate here because the tools are read-only and return mock data. (Later steps and the [tool-approval docs](https://learn.microsoft.com/agent-framework/agents/tools/tool-approval) cover tools that *should* require a confirmation step.)
 
-The **Microsoft Agent Framework** is the Python/.NET SDK we use to build the agent in code. Here, `FoundryChatClient` connects to your Foundry project and model deployment, `Agent` defines TravelBuddy's name and instructions, and `ResponsesHostServer` exposes the agent through the Responses protocol. `DefaultAzureCredential` reuses the Azure sign-in you created with `az login`.
-
-The YAML files are the smallest hosted-agent package:
-
-- `agent.yaml` describes the local hosted runtime that `azd ai agent run` and the Foundry Toolkit can start.
-- `agent.manifest.yaml` describes the template metadata that `azd ai agent init` (and the Foundry Toolkit) reads to scaffold the Azure deployment artifacts (`azure.yaml` and `infra/`).
-- `main.py` is ordinary Python code, so you can run the same agent locally before deploying it.
-- `Dockerfile` and `.dockerignore` package `main.py` and its dependencies into the container image Foundry runs.
-- `.azdignore` keeps scaffolding-only files (`agent.manifest.yaml`, `agent.yaml`, `.env.example`) out of that deployment upload.
+For the workshop these tools return **mock** data, but the registration pattern is the real lesson: later you can swap the mock bodies for real weather, time-zone, or exchange-rate APIs without changing how the agent registers them. Note also that local tools run **in-process** inside the same hosted-agent container — they add no new Azure resources, so your `agent.manifest.yaml` and deployment shape barely change from Step 1.
 
 ```mermaid
 flowchart LR
-    User[User] --> Client[Agent Framework Client]
-    Client --> Project[Foundry Project]
-    Project --> Agent["Hosted agent: ${WORKSHOP_RESOURCE_PREFIX}-travel-buddy"]
-    Project --> Model[Model deployment]
-    Agent --> Model
+    User[User] --> Agent[TravelBuddy Agent]
+    Agent -->|tool call + JSON args| Function[Python function]
+    Function -->|JSON-serialisable result| Agent
+    Agent -->|final answer| User
 ```
 
 Helpful references:
 
-- [What is Microsoft Foundry?](https://learn.microsoft.com/azure/ai-foundry/what-is-azure-ai-foundry)
-- [Create a project for Microsoft Foundry](https://learn.microsoft.com/azure/ai-foundry/how-to/create-projects)
-- [What are hosted agents?](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents)
-- [agent.yaml / agent.manifest.yaml schema reference](https://learn.microsoft.com/azure/foundry/agents/concepts/agent-yaml-reference)
-- [Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/overview/agent-framework-overview)
-- [Upstream `01-basic` hosted-agent sample](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/01-basic)
+- [Using function tools with an agent](https://learn.microsoft.com/agent-framework/agents/tools/function-tools) — how the Agent Framework turns a Python function into a tool and infers its schema.
+- [Create the agent with function tools](https://learn.microsoft.com/agent-framework/agents/tools/function-tools#create-the-agent-with-function-tools) — passing functions via `tools=[...]`.
+- [Tool approval](https://learn.microsoft.com/agent-framework/agents/tools/tool-approval) — what `approval_mode` controls and when to require confirmation.
+- [Function calling in Microsoft Foundry Agents](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/function-calling) — the tool-calling loop from the Foundry side.
+- [What are hosted agents?](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents) — the hosted boundary your tools run inside.
+- [Upstream `02-tools` hosted-agent sample](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/02-tools) — the sample this step is based on.
 
 ## Steps
 
-### 1. Review `travel_assistant/agent.yaml`
+### 1. Implement the tools in `travel_assistant/tools.py`
 
-**Why this file exists:** `agent.yaml` is the **AgentDefinition** — the concrete hosted-agent runtime. It gives the agent a name, declares that it serves the `responses` protocol, sets a small CPU/memory shape, and lists the environment variables the runtime needs. It's a [ContainerAgent](https://learn.microsoft.com/azure/foundry/agents/concepts/agent-yaml-reference#template-containeragent) (an AgentDefinition with `kind: hosted`).
+Open the stub `travel_assistant/tools.py` and replace its `TODO` with the three mock functions below. Each is a normal Python function with type hints and a docstring written for the model as much as for a human reader.
 
-**What you do:** nothing to edit — this file is ready to run. Read it so you recognize each block. The name uses `${WORKSHOP_RESOURCE_PREFIX}` so your agent stays unique when many people deploy into the same project; the `${...}` values are resolved from your `.env` at run/deploy time.
+The three tools you're adding:
 
-**What happens at run/deploy time:** `azd ai agent run` and the Foundry Toolkit read this file to start the local Responses host. Deployment tooling uses the same contract so the hosted runtime in Foundry receives the right environment values.
+- **`get_weather(city, date=None)`** — returns mock current-or-planned-date weather for a destination. The optional `date` argument shows how the model can pass extra context when the traveler asks about a specific day; a `None` default makes it optional in the generated schema.
+- **`get_local_time(city)`** — maps a known city to a time zone (via the small `CITY_TIME_ZONES` table) and returns the current local time, falling back to UTC for unknown cities. This is why time-zone answers stay correct without the model guessing.
+- **`convert_currency(amount, from_currency, to_currency)`** — converts a price between USD, EUR, JPY, and GBP using static mock rates, and returns a structured result (with a `note`) when a currency isn't supported instead of raising.
 
-Open `travel_assistant/agent.yaml` in your editor and skim it — the file is annotated with inline comments that explain each block.
+```python
+# travel_assistant/tools.py
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-### 2. Review `travel_assistant/agent.manifest.yaml`
+from agent_framework import tool
 
-**Why this file exists:** the manifest is the **AgentManifest** — a parameterized template that deployment tooling reads to *scaffold* your hosted agent (**scaffold** = automatically generate the starter project files so you don't write them by hand). It carries top-level metadata (name, description, tags), a `template` block (the hosted-agent definition), and a `resources` list of what deployment tooling should provision. The `name` fields are plain literals (`travel-buddy`). See the [schema reference](https://learn.microsoft.com/azure/foundry/agents/concepts/agent-yaml-reference) for every field.
 
-> **Note — Why the names here are literals, and how values get filled in.** `azd ai agent init` validates the agent name *before* any substitution, so a `${...}` or `{{...}}` value in the `name` fields would fail; you attach your per-user prefix at init time with `--agent-name` (see the deploy step below). The `environment_variables` values use `${VAR}` references that resolve from your `.env` at run/deploy time — the same way `agent.yaml` does. (`{{ param }}` placeholders are only for values you declare in a `parameters:` block and get prompted for during `azd ai agent init`; this workshop doesn't use them.)
+CITY_TIME_ZONES = {
+    "lisbon": "Europe/Lisbon",
+    "london": "Europe/London",
+    "new york": "America/New_York",
+    "reykjavik": "Atlantic/Reykjavik",
+    "san francisco": "America/Los_Angeles",
+    "seattle": "America/Los_Angeles",
+    "tokyo": "Asia/Tokyo",
+}
 
-**What you do:** nothing to edit — this file is ready to use. Read it so you understand what it declares. Notice that `resources` is **empty (`[]`)**: you already deployed a model in Step 0, and the agent picks it up at runtime through the `AZURE_AI_MODEL_DEPLOYMENT_NAME` environment variable (see [Model resource](https://learn.microsoft.com/azure/foundry/agents/concepts/agent-yaml-reference#model-resource)). Because the model already exists, there's nothing for `azd` to provision, so you don't declare a `kind: model` resource here.
+MOCK_RATES_TO_USD = {
+    "USD": 1.0,
+    "EUR": 1.09,
+    "JPY": 0.0067,
+    "GBP": 1.27,
+}
 
-**What happens at run/deploy time:** `azd ai agent init -m travel_assistant/agent.manifest.yaml` reads this file to generate the root deployment artifacts (`azure.yaml` and `infra/`). With no model resource declared, it wires up only the container-hosting infrastructure and leaves your existing model deployment alone. The Foundry Toolkit also uses manifest metadata when walking you through hosted-agent setup.
 
-Open `travel_assistant/agent.manifest.yaml` and read through it — the inline comments call out what each block declares and why `resources` is empty.
+@tool(approval_mode="never_require")
+def get_weather(city: str, date: str | None = None) -> dict:
+    """Return mock weather for a destination city and optional travel date.
 
-### 3. Write TravelBuddy's instructions in `travel_assistant/main.py`
+    Use this when a traveler asks about current weather, weather for a planned
+    date, packing conditions, or comparing weather across destinations. The data
+    is mocked for the workshop and should be replaced with a real weather API in
+    production.
+    """
+    requested_date = date or "today"
+    return {
+        "city": city,
+        "date": requested_date,
+        "temp_c": 22,
+        "condition": "sunny",
+        "note": "mock data — replace with a real API",
+    }
 
-**Why this file exists:** `main.py` is the Python process that hosts TravelBuddy. It creates the Foundry model client, defines the agent instructions, and starts the Responses server.
 
-**What you edit:** the scaffold already wires up `FoundryChatClient`, `Agent`, and `ResponsesHostServer` — you complete the single `TODO` inside `main()`, replacing the placeholder `instructions=` string with TravelBuddy's system prompt: a friendly travel assistant that gives practical, concise trip-planning advice with local context, budget awareness, and safety-minded tips.
+@tool(approval_mode="never_require")
+def get_local_time(city: str) -> dict:
+    """Return the current local time for a city using a small city-to-time-zone map.
 
-**What happens at run/deploy time:** locally, this process serves an OpenAI-compatible Responses endpoint on `http://localhost:8088`. After deployment, Foundry starts the same code as the hosted container entry point.
+    Use this when a traveler asks what time it is in a destination, whether it is
+    a good time to call a hotel, or how time zones compare between cities. Cities
+    outside the workshop map fall back to UTC.
+    """
+    tz_name = CITY_TIME_ZONES.get(city.strip().lower(), "UTC")
+    now = datetime.now(ZoneInfo(tz_name))
+    return {
+        "city": city,
+        "iso_time": now.isoformat(timespec="seconds"),
+        "tz": tz_name,
+    }
 
-Open `travel_assistant/main.py` and complete the `TODO`. If you get stuck, the finished file is in [`.workshop/solutions/01-basic/`](.workshop/solutions/01-basic/).
 
-`ResponsesHostServer` is the hosted-agent contract: when started locally it serves an OpenAI-compatible Responses endpoint on `http://localhost:8088`; when packaged and deployed to Foundry it becomes the container entry point. The same code runs in both places.
+@tool(approval_mode="never_require")
+def convert_currency(amount: float, from_currency: str, to_currency: str) -> dict:
+    """Convert a mock travel price between USD, EUR, JPY, and GBP.
 
-> **Note — Three different "names" show up in this step — they live at different layers and don't have to match.**
->
-> - **Manifest name** — `name` / `template.name` in `agent.manifest.yaml` (`travel-buddy`) is the template's declared identity, the value `azd ai agent init` reads to scaffold your agent. It **must be a plain literal**: `init` validates it *before* any variable substitution, so `${WORKSHOP_RESOURCE_PREFIX}-…` would be rejected. You attach your per-user prefix separately, at init time, with `--agent-name` (see the deploy step below). Reference: [agent.yaml / manifest schema](https://learn.microsoft.com/azure/foundry/agents/concepts/agent-yaml-reference).
-> - **Deployed agent name** — the `name` in `agent.yaml` (`${WORKSHOP_RESOURCE_PREFIX}-travel-buddy`), resolved with your prefix via `--agent-name`, is the **hosted agent's identity in your Foundry project** — what the portal shows and what `.workshop/scripts/cleanup.py` matches on to tear things down. Reference: [Manage hosted agents (azd)](https://learn.microsoft.com/azure/foundry/agents/how-to/manage-hosted-agent).
-> - **Runtime name** — `Agent(name="travel-buddy")` in `main.py` is the **Agent Framework's in-process name**. It's a code-level string (not an Azure resource name, so it isn't bound by azd's naming rules). It appears in tracing/observability, identifies the responder in the Responses output, and — most importantly — becomes the **reference key when you compose agents later**: with `as_tool()` (agent-as-a-tool) or handoffs, an agent's `name` is the tool/route name the coordinator calls. That's why Step 7 gives each specialist its own name. Reference: [Agent Framework agents](https://learn.microsoft.com/agent-framework/agents/).
->
-> The template and in-code names are both `travel-buddy`; only the **deployed** agent differs, carrying your prefix as `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy`. They live at different layers, so they don't have to match — but using one stable base name keeps the agent easy to follow as it grows across steps.
+    Use this for hotel prices, activity costs, meal budgets, or itinerary totals
+    when the traveler asks for an approximate conversion. The exchange rates are
+    static mock values for the workshop.
+    """
+    from_code = from_currency.upper()
+    to_code = to_currency.upper()
 
-### 4. Review the container and deploy files
+    if from_code not in MOCK_RATES_TO_USD or to_code not in MOCK_RATES_TO_USD:
+        return {
+            "input": {"amount": amount, "currency": from_code},
+            "output": None,
+            "rate": None,
+            "note": "mock data — supported currencies: USD, EUR, JPY, GBP",
+        }
 
-Three more files ship with Step 1. You don't edit them, but reading them shows how TravelBuddy goes from local Python to a container Foundry runs.
+    amount_usd = amount * MOCK_RATES_TO_USD[from_code]
+    converted = amount_usd / MOCK_RATES_TO_USD[to_code]
+    rate = MOCK_RATES_TO_USD[from_code] / MOCK_RATES_TO_USD[to_code]
 
-**`Dockerfile` — how the agent is packaged.** Foundry runs your hosted agent as a container, and this is the recipe. It starts from `python:3.12-slim`, copies your `travel_assistant/` code into the image, installs `requirements.txt`, exposes port **8088**, and launches `python main.py`. That `EXPOSE 8088` matches the port `ResponsesHostServer` listens on, so the same entry point you run locally is what serves traffic once deployed.
-
-**`.dockerignore` — what stays out of the image.** It excludes local-only cruft (`.venv`, `__pycache__`, `*.pyc`, …) so the build context stays small, and — importantly — it excludes **`.env`** so your local secrets are never baked into the container image. A deployed runtime gets its configuration from the azd/Foundry environment, not from a file in the image.
-
-**`.azdignore` — what `azd` doesn't upload.** When `azd` packages your agent for deployment, it skips everything listed here. Step 1 ignores three files, because none of them belong in the deployed container:
-
-- **`agent.manifest.yaml`** — a **scaffolding-time** template. `azd ai agent init` reads it once to generate `azure.yaml` and `infra/`; the running container never needs it.
-- **`agent.yaml`** — its contents are **folded into the generated `azure.yaml`** during scaffolding, so the deployment already carries this information and shipping `agent.yaml` again would be redundant.
-- **`.env.example`** — only a placeholder template. Real configuration comes from your azd environment (`.env`), so the sample doesn't belong in the upload.
-
-Open the three files and skim them so you recognize what each one controls.
-
-### 5. Confirm env
-
-Make sure your `.env` contains values for `AZURE_AI_PROJECT_ENDPOINT` and `AZURE_AI_MODEL_DEPLOYMENT_NAME`. If you're unsure, rerun:
-
-<!-- terminal -->
-```bash
-# If you activated .venv
-python .workshop/scripts/preflight.py --step 1
-
-# If you're using uv without activation
-uv run python .workshop/scripts/preflight.py --step 1
+    return {
+        "input": {"amount": amount, "currency": from_code},
+        "output": {"amount": round(converted, 2), "currency": to_code},
+        "rate": round(rate, 6),
+        "note": "mock data",
+    }
 ```
+
+**What makes these work as tools:**
+
+- **The `@tool` decorator** registers each function and its `approval_mode="never_require"` setting so the runtime auto-runs it in the tool-call loop instead of pausing for approval.
+- **Type hints drive the schema.** `city: str`, `amount: float`, and `date: str | None = None` become the tool's parameter types; the `= None` default marks `date` as optional. Use only JSON-serialisable types (`str`, `int`, `float`, `bool`, `dict`, `list`) — the framework can't build a schema for custom classes.
+- **The docstring is the model's manual.** The first line becomes the tool description and the "Use this when…" guidance nudges the model toward the right tool. Vague docstrings are the most common reason a tool never gets called.
+- **Return JSON-friendly data.** Each function returns a `dict` the model can read back and turn into prose. Returning a structured result (with a `note`) for unsupported currencies is friendlier to the model than raising an exception.
+
+### 2. Register the tools in `travel_assistant/main.py`
+
+Your `main.py` is already complete from Step 1 — don't rewrite it. There are only **two functional additions**: import the tools, and pass them to the `Agent` via `tools=[...]`. Then extend TravelBuddy's instructions with one sentence so the model knows the tools exist.
+
+Add the import near the top, with the other imports:
+
+```python
+# travel_assistant/main.py
+from tools import convert_currency, get_local_time, get_weather
+```
+
+Then update the `Agent(...)` call. **Keep your Step 1 instructions exactly as they are** and just append the two-line tools sentence, and add the `tools=[...]` argument:
+
+```python
+    agent = Agent(
+        client=client,
+        name="travel-buddy",
+        instructions=(
+            # ... keep your Step 1 instructions here ...
+            "Use your tools for weather, local time, and currency conversion "
+            "when the traveler asks time-sensitive questions. Keep answers brief."
+        ),
+        tools=[get_weather, get_local_time, convert_currency],  # <-- add this line
+        default_options={"store": False},
+    )
+```
+
+That's the whole change: the `from tools import ...` line and the `tools=[...]` argument do the wiring; the appended instructions just tell the model when to reach for the tools. Everything else in `main.py` is unchanged from Step 1. If you get stuck, the finished file is in [`.workshop/solutions/02-tools/`](.workshop/solutions/02-tools/).
+
+### 3. Update the metadata in `travel_assistant/agent.manifest.yaml`
+
+Local Python tools run inside your hosted-agent process, so the manifest **structure doesn't change** — same `template`, same `protocols`, and `resources` stays empty (`[]`) because no new Azure resource is needed. The edits are **metadata only**: update the human-facing `description`, add a `Function Tools` tag, and declare the three tools under `metadata.tool_declarations` so anyone browsing the agent can see what it can do.
+
+Update the `description`:
+
+```yaml
+# travel_assistant/agent.manifest.yaml
+description: >
+  TravelBuddy is an Agent Framework hosted agent with local Python function
+  tools for destination weather, local time, and currency conversion.
+```
+
+Then extend `metadata` — add the new `Function Tools` tag and the `tool_declarations` block (`Travel Assistant` is already in the Step 1 tags):
+
+```yaml
+metadata:
+  tags:
+    - Agent Framework
+    - AI Agent Hosting
+    - Azure AI AgentServer
+    - Responses Protocol
+    - Travel Assistant
+    - Function Tools     # <-- added
+  tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
+    - name: get_weather
+      description: Returns mock destination weather for a city and optional date.
+      parameters:
+        city: string
+        date: "string | null"
+    - name: get_local_time
+      description: Returns the current local time for a destination city.
+      parameters:
+        city: string
+    - name: convert_currency
+      description: Converts mock travel prices between USD, EUR, JPY, and GBP.
+      parameters:
+        amount: float
+        from_currency: string
+        to_currency: string
+```
+
+`tool_declarations` is **descriptive metadata** — it documents the tools for humans and tooling that browse the manifest; the tools themselves are still registered in code via `tools=[...]` in `main.py`. Leave the `template` block, the `environment_variables`, and `resources: []` exactly as they were in Step 1. No new Azure resources are declared, so you won't need to re-provision — but because `azd ai agent init` **copied** your code and manifest into the project folder in Step 1, you will re-run `azd ai agent init` in the next section to refresh that copy with these changes before deploying.
 
 ## Run and deploy TravelBuddy
 
-You can run and deploy TravelBuddy two ways: with the [**Azure Developer CLI** (`azd`)](#option-1--azure-developer-cli-azd) or with the [**VS Code Foundry Toolkit**](#option-2--vs-code-foundry-toolkit) extension. Both wrap the same hosted-agent contract — pick one. The workshop's later steps default to `azd` snippets because they script cleanly, but the Toolkit gives you the same flow in a UI.
+**Do you need to re-init? Yes.** In Step 1, `azd ai agent init` **copied** your `travel_assistant/` code into the generated `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder — that copy is the snapshot azd actually builds and deploys. Your Step 2 edits live in `travel_assistant/` (the new `tools.py` and the `main.py` changes), so the copied snapshot is now **stale**. Re-run `azd ai agent init` to refresh it before you run or deploy; it re-copies the current `travel_assistant/` code and re-reads the updated `agent.manifest.yaml`.
 
-> **One-time generated files:** these are created once and reused by later steps — don't regenerate them per step. [Option 1 — Azure Developer CLI (`azd`)](#option-1--azure-developer-cli-azd) generates a **project folder named after your agent** (`${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/`) containing `azure.yaml` and `infra/`; [Option 2 — VS Code Foundry Toolkit](#option-2--vs-code-foundry-toolkit) generates `.vscode/tasks.json` and `.vscode/launch.json`. Don't just keep these files — **commit them when the step is complete**. Pushing them to `main` is what loads the next step.
+You do **not** need `azd provision` again — you added no new Azure resources (`resources:` is still `[]`), so the infrastructure from Step 1 is unchanged. The re-init just refreshes the copied code + manifest, and then `azd deploy` ships the new container version.
 
-### Option 1 — Azure Developer CLI (`azd`)
+> Prefer not to re-init? You can instead copy your edited files (`travel_assistant/tools.py` and `travel_assistant/main.py`) into the code directory inside `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` and skip straight to `azd deploy`. Re-init is the reliable path because it also picks up the manifest changes and can't drift out of sync.
 
-1. **Scaffold `azure.yaml` and `infra/`** from the manifest (one-time per workshop):
-
-   Load your `.env` into the shell first (the repo `.env` isn't auto-loaded — only Python's `load_dotenv()` and azd's YAML templating read it), then pass the expanded prefix to `--agent-name`:
+1. **Re-init from the repository root.** Load your `.env` into the shell first — the repo `.env` isn't auto-loaded, and the shell needs `WORKSHOP_RESOURCE_PREFIX` to expand `--agent-name` (and to `cd` into the folder later):
 
    <!-- terminal -->
    ```bash
@@ -199,13 +295,9 @@ You can run and deploy TravelBuddy two ways: with the [**Azure Developer CLI** (
      --agent-name "$($env:WORKSHOP_RESOURCE_PREFIX)-travel-buddy"
    ```
 
-   This reads your manifest, asks any setup questions it needs, and creates a **new project folder named after your agent** (`${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/`) containing the `azure.yaml` and `infra/` that `azd provision` and `azd deploy` use. If that folder already exists from an earlier run, don't delete it just because you moved to a new step.
+   This refreshes the `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` folder with your updated `main.py`, the new `tools.py`, and the updated manifest metadata.
 
-   > **Why `--agent-name`?** The manifest's `name`/`template.name` must be a plain literal (`travel-buddy`) — `azd ai agent init` validates the agent name *before* any substitution, so a `${WORKSHOP_RESOURCE_PREFIX}-…` or `{{…}}` value there would fail with `invalid agent name`. But the **deployed** Foundry agent identity should still carry your prefix so it stays unique in shared projects and so `.workshop/scripts/cleanup.py` (which deletes only resources whose names start with `WORKSHOP_RESOURCE_PREFIX`) can find it. Passing `--agent-name` sets that deployed identity explicitly, matching the name `agent.yaml` already uses locally (`${WORKSHOP_RESOURCE_PREFIX}-travel-buddy`).
-
-   > **Why load `.env` instead of putting `${WORKSHOP_RESOURCE_PREFIX}` directly on the flag, like in `agent.yaml`?** Those are two different substitution engines. Inside `agent.yaml`/`agent.manifest.yaml`, `${WORKSHOP_RESOURCE_PREFIX}` is *azd's* template placeholder, which azd resolves from `.env` when it reads those files. `--agent-name` is a **command-line argument** that azd validates *before* any templating, so azd's `${…}` syntax isn't interpreted there. Instead, **your shell** expands the variable — but the repo `.env` isn't auto-loaded into your shell, which is why you load it first with the one-liner above before passing the already-expanded value.
-
-   After init, azd creates the **project folder named after your agent** (`${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/`). `cd` into it and set the variables that `azure.yaml` references in the **azd env** — keep your `.env` loaded in the shell (same one-liner as above) so you can pass the values through:
+2. **`cd` into the project folder and confirm the azd env values.** If the re-init reset the azd environment, re-set the three variables (they're idempotent, so it's safe to run them again). Keep `.env` loaded in the shell so you can pass the values through:
 
    <!-- terminal -->
    ```bash
@@ -225,17 +317,6 @@ You can run and deploy TravelBuddy two ways: with the [**Azure Developer CLI** (
    azd env set WORKSHOP_RESOURCE_PREFIX "$env:WORKSHOP_RESOURCE_PREFIX"
    ```
 
-   > **Why azd asks for these when they're already in `.env`.** azd keeps its **own** environment store at `.azure/<env-name>/.env` inside the new project folder, which is **separate from the repo-root `.env`** you've been editing. The generated `azure.yaml` reads from the *azd* env, so azd doesn't see the values in your repo `.env` and asks you to set them once. `cd` into the project folder, then run the `azd env set` commands azd printed.
-
-2. **Provision** the hosted-agent infrastructure (first deploy only):
-
-   <!-- terminal -->
-   ```bash
-   azd provision
-   ```
-
-   This signs into Azure through `azd`, asks you to choose a subscription/location if needed, and creates the container-hosting infrastructure (resource group, container registry, and supporting resources) wired to the Foundry project from your `.env`. It does **not** create a model deployment — you already deployed one in Step 0, and the agent uses it at runtime via `AZURE_AI_MODEL_DEPLOYMENT_NAME`. Wait for a successful summary before continuing.
-
 3. **Run TravelBuddy locally** in the hosted Responses runtime:
 
    <!-- terminal -->
@@ -243,77 +324,321 @@ You can run and deploy TravelBuddy two ways: with the [**Azure Developer CLI** (
    azd ai agent run
    ```
 
-   `azd` reads `agent.yaml`, substitutes values from your environment, and starts the server on `http://localhost:8088`. Leave this terminal running; it is your local hosted-agent process.
+   `azd` reads `agent.yaml`, substitutes values from your azd environment, and starts the server on `http://localhost:8088` — now with your three tools loaded. Leave this terminal running.
 
-4. **Invoke the local agent from a new terminal.** The `azd ai agent run` process from the previous step is still running and holding its terminal, so open a **second terminal** for this command (in the same project folder):
+4. **Invoke the local agent from a second terminal.** The `azd ai agent run` process is still holding the first terminal, so open a **new** one (in the same project folder) and send a prompt that needs live information, so the model has a reason to call a tool:
 
    <!-- terminal -->
    ```bash
-   azd ai agent invoke --local "I'm planning a trip to Lisbon — give me three things you'd want me to know."
+   azd ai agent invoke --local "What's the weather in Tokyo right now and what time is it there?"
    ```
 
-   Expected: TravelBuddy streams a travel-focused answer back to your terminal.
+   Expected: TravelBuddy calls `get_weather` and `get_local_time`, then combines both results into one natural-language answer.
 
-   Prefer a UI? With the local agent still running, open the **Agent Inspector** from the Foundry Toolkit (Command Palette → **Foundry Toolkit: Open Agent Inspector**, or the **Agent Inspector** entry under **Developer Tools**). It connects to `http://localhost:8088` and lets you chat with TravelBuddy and watch the streamed Responses events.
+   Prefer a UI? With the local agent still running, open the **Agent Inspector** from the Foundry Toolkit (Command Palette → **Foundry Toolkit: Open Agent Inspector**). It connects to `http://localhost:8088` and shows each streamed tool call and result.
 
-   ![Foundry Toolkit Agent Inspector connected to the local TravelBuddy agent on localhost:8088, showing the Playground chat and streamed response events](.workshop/docs/assets/01-agent-inspector.png)
-
-5. **Deploy to Foundry**. Subsequent workshop steps only need `azd deploy`:
+5. **Deploy to Foundry**:
 
    <!-- terminal -->
    ```bash
    azd deploy
    ```
 
-   The first deploy builds the container, pushes it to your Azure Container Registry, and starts the hosted agent runtime in Foundry. Expect ~5–10 minutes.
+   This builds the container image from the **refreshed** project-folder snapshot — now including `tools.py` and your updated `main.py` — pushes it to your Azure Container Registry, and rolls out a new hosted agent version. No `azd provision` is needed because the infrastructure is unchanged.
 
 6. **Invoke the deployed agent**:
 
    <!-- terminal -->
    ```bash
-   azd ai agent invoke "I'm planning a trip to Lisbon — give me three things you'd want me to know."
+   azd ai agent invoke "What's the weather in Tokyo right now and what time is it there?"
    ```
 
-   Prefer a UI? Open the **Hosted Agent Playground** from the Foundry Toolkit (under **Developer Tools** → **Build** → **Hosted Agent Playground**). Pick your deployed agent and version, then chat with TravelBuddy and inspect session details, logs, and traces directly in VS Code.
-
-   ![Foundry Toolkit Hosted Agent Playground with the deployed TravelBuddy agent selected, showing the Playground chat and session details panel](.workshop/docs/assets/01-hosted-agent-playground.png)
-
-   When you select **Hosted Agent Playground** in the Foundry Toolkit's **Developer Tools**, you'll be prompted to sign in. If the interactive sign-in doesn't complete, cancel it and choose the **device code** flow instead. Once signed in, select the Foundry project that hosts your deployed agent.
-
-### Option 2 — VS Code Foundry Toolkit
-
-The [Foundry Toolkit](https://marketplace.visualstudio.com/items?itemName=ms-windows-ai-studio.windows-ai-studio) is pre-installed in Codespaces by the devcontainer. If you're using local VS Code, the repo's `.vscode/extensions.json` recommends it; accept the install prompt or install it from the Marketplace.
-
-1. Open the Command Palette (`Ctrl+Shift+P`) → **Foundry Toolkit: Create Hosted Agent** (or open the existing `travel_assistant/` hosted-agent folder if you've already completed the scaffold). The extension creates `.vscode/tasks.json` and `.vscode/launch.json`, then walks you through **Foundry Project Setup** to choose a subscription and existing Foundry project, or create one.
-2. Press **F5** to start TravelBuddy locally in debug mode. VS Code should run the generated task, start `travel_assistant/main.py`, and show that the Responses host is listening on `http://localhost:8088`.
-3. Command Palette → **Foundry Toolkit: Open Agent Inspector**. The Inspector connects to the running local agent so you can send messages and watch streamed responses.
-4. Command Palette → **Foundry Toolkit: Deploy Hosted Agent**. The wizard reads `agent.yaml` and opens **Deploy Hosted Agent**:
-   - Confirm subscription/project under **Basics**.
-   - Pick deployment method (**Code** or **Container**), then confirm the agent name is **`${WORKSHOP_RESOURCE_PREFIX}-travel-buddy`** — the same prefixed identity the `azd` path sets with `--agent-name`. The wizard prefills it from `agent.yaml`'s `name`; if it shows the unresolved `${WORKSHOP_RESOURCE_PREFIX}` placeholder or a bare `travel-buddy`, set it to your prefixed value so the deployed agent stays unique in shared projects and `.workshop/scripts/cleanup.py` can find it later.
-   - On **Review + Deploy**, pick CPU/memory and click **Deploy**.
-5. After deployment, open the agent in the **Agent Playground** and stream live logs from the **Logs** tab in the Toolkit sidebar. You should see the deployed TravelBuddy respond the same way your local debug run did.
+   Prefer a UI? Open the **Hosted Agent Playground** from the Foundry Toolkit (**Developer Tools** → **Build** → **Hosted Agent Playground**), pick your deployed agent and version, and watch the tool calls in the session details.
 
 ## Try it
 
-Whichever option you picked, try a few prompts:
+- "What's the weather in Tokyo right now and what time is it there?"
+- "If a hotel costs 28,000 JPY, how much is that in EUR?"
+- "Compare current weather in Lisbon, Reykjavik, and Tokyo."
 
-- "I'm planning a trip to Lisbon — give me three things you'd want me to know."
-- "What's a budget-friendly weekend in Reykjavik like?"
-- "Compare Tokyo and Seoul for a first-time visitor."
+For the comparison prompt, the model may call `get_weather` once per city.
 
 ## Troubleshooting
 
-- **`DefaultAzureCredential failed`**: run `az login`, confirm `az account show` returns your tenant.
-- **`Model deployment not found`**: confirm `AZURE_AI_MODEL_DEPLOYMENT_NAME` matches the deployment name in your Foundry project (case-sensitive).
-- **`401 Unauthorized`**: your Entra ID needs the `Cognitive Services User` (and ideally `Azure AI Developer`) role on the Foundry project resource.
+- **Tools never get called**: the model decides whether to call them. Make sure your docstring is descriptive (the model reads it). Try a prompt that explicitly needs real-time info.
+- **`Function signature mismatch`**: the Agent Framework needs JSON-serialisable types. Use `str`, `int`, `float`, `bool`, `dict`, `list` — not custom classes.
+- **`Schema generation failed`**: missing type hint on a parameter. Add `: type` for every arg.
+- **`ModuleNotFoundError: tools`**: run from the repository root with `python travel_assistant/main.py`, or use `azd ai agent run` from the project folder.
+- **Unknown city time zones**: add the city to `CITY_TIME_ZONES`, or let the mock fall back to UTC.
+- **Currency values look approximate**: they are static mock rates. Replace `MOCK_RATES_TO_USD` with a real exchange-rate API for production.
+- **Deploy didn't pick up my tools**: `azd ai agent init` **copied** your code into the `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder, so edits in `travel_assistant/` don't deploy on their own. Re-run `azd ai agent init` (step 1 above) to refresh that snapshot — or copy `tools.py`/`main.py` into the folder's code directory — then `azd deploy` again.
+
+## Optional: Observe TravelBuddy's tool calls with Application Insights
+
+You just gave TravelBuddy three tools — wouldn't it be nice to *watch* each one fire: which tool the model chose, with what arguments, how long it took, and how many tokens the run cost? Foundry hosted agents have **built-in observability**. The Agent Framework is instrumented out of the box, and the Foundry hosting runtime exports those traces to **Application Insights** for you. There's **no code to write, no package to add, and no manifest change** — your `resources: []` stays exactly as it is. You connect an Application Insights resource **with managed-identity authentication** — the connection string stops being a credential — grant a few least-privilege roles, and the traces appear.
+
+Each invocation becomes a span tree you can drill into:
+
+- `invoke_agent` — the top-level span for one request to TravelBuddy.
+- `chat` — each model call inside that request.
+- `execute_tool` — one span per tool the model runs, so `get_weather`, `get_local_time`, and `convert_currency` each show up **by name**, with their arguments and results.
+
+> This is entirely optional and needs a **deployed** agent — traces flow from the hosted runtime, not from `python main.py`. Skip it if you just want to finish the core step.
+>
+> You'll also need enough Azure rights for the setup below — the baseline **Foundry User** role isn't enough on its own:
+>
+> - **create a connection on the Foundry project** (`Microsoft.CognitiveServices/accounts/projects/connections/write`),
+> - **create an Application Insights resource** and read it (plus `Microsoft.OperationalInsights/workspaces/write` if the wizard also creates the linked workspace),
+> - **change the Application Insights resource's settings** (`Microsoft.Insights/components/write`, to disable local authentication), and
+> - **assign roles** (`Microsoft.Authorization/roleAssignments/write`) on it and its Log Analytics workspace.
+>
+> If you can't, ask an administrator to make the scoped assignments below — none of them needs subscription-level Owner.
+
+### 1. Connect Application Insights to your project (keyless)
+
+Foundry turns on **server-side tracing** the moment you connect an Application Insights resource — no code, and traces appear within minutes.
+
+1. Open your project in the [Microsoft Foundry portal](https://ai.azure.com/) (make sure **New Foundry** is on).
+2. In the left navigation select **Agents**, then the **Traces** tab at the top.
+3. Select **Connect**, then either pick an existing Application Insights resource or choose **Create new**.
+4. **Before** you finish the wizard, set **Auth type** to **Project Managed Identity** — *not* the connection string. The wizard defaults to connection-string auth, so changing it afterwards means an extra conversion step. Foundry then ingests traces with the project's managed identity instead of a key.
+5. Complete the wizard and select **Create**. A confirmation appears when the connection succeeds.
+
+> **Prefer a dedicated resource.** Later in this section you'll disable local (key-based) authentication on the Application Insights resource, which applies **resource-wide** — any other app still publishing with an instrumentation key or connection string stops being able to write to it. Creating a fresh `${WORKSHOP_RESOURCE_PREFIX}-appinsights` keeps that blast radius to your own workshop. If you must reuse an existing shared resource, confirm every publisher already authenticates with Entra ID first.
+
+> **Already connected with a connection string?** Convert it in place: project name menu → **Project details** → **Connected resources** → select the Application Insights connection → **Edit authentication** → **Project managed identity** → **Save**.
+
+> **Name it, then clean it up yourself.** If you create a new resource, prefix its name with your `WORKSHOP_RESOURCE_PREFIX` (for example `${WORKSHOP_RESOURCE_PREFIX}-appinsights`) so it's easy to spot later. Application Insights is created *out-of-band* — it isn't in the manifest, so **neither `azd down` nor `.workshop/scripts/cleanup.py` removes it**. Delete it (and any Log Analytics workspace the wizard created alongside it) when you're done, for example `az resource delete --ids <app-insights-resource-id>`.
+
+Note the resource ID — every command below reuses it. **Re-run this in each new terminal**, because an unset scope is the one mistake that really bites: `az role assignment create --scope ""` doesn't fail, it silently falls back to **subscription scope** and grants far more than you intended. Each block below guards against that.
+
+<!-- terminal -->
+```bash
+export APP_INSIGHTS="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"
+```
+
+<!-- terminal -->
+```powershell
+$env:APP_INSIGHTS = "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"
+```
+
+### 2. Let both writing identities emit traces
+
+A hosted agent emits telemetry from **two** identities, and each needs **Monitoring Metrics Publisher** on the Application Insights resource:
+
+- the **project managed identity** emits the server-side spans. When you *create* the connection with **Project Managed Identity**, the portal assigns this role for you — but the **Edit authentication** conversion path doesn't always, so assign it explicitly below rather than assume.
+- the **agent's instance identity** emits everything your code produces inside the sandbox. It **never** gets this role automatically.
+
+**Grant the project managed identity.** Copy its **Object (principal) ID** from the project's **Identity** page in the portal (assigning an existing role again is harmless):
+
+<!-- terminal -->
+```bash
+: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope}"
+PROJECT_MI_ID="<project-managed-identity-object-id>"   # from the project's Identity page
+
+az role assignment create \
+  --assignee-object-id "$PROJECT_MI_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Monitoring Metrics Publisher" \
+  --scope "$APP_INSIGHTS"
+```
+
+<!-- terminal -->
+```powershell
+if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope" }
+$PROJECT_MI_ID = "<project-managed-identity-object-id>"   # from the project's Identity page
+
+az role assignment create `
+  --assignee-object-id $PROJECT_MI_ID `
+  --assignee-principal-type ServicePrincipal `
+  --role "Monitoring Metrics Publisher" `
+  --scope $env:APP_INSIGHTS
+```
+
+**Grant the agent's instance identity** the same least-privilege role:
+
+<!-- terminal -->
+```bash
+# Load your .env values first if this is a fresh shell: set -a; source .env; set +a
+: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope}"
+: "${WORKSHOP_RESOURCE_PREFIX:?Set WORKSHOP_RESOURCE_PREFIX (from your .env)}"
+: "${AZURE_AI_PROJECT_ENDPOINT:?Set AZURE_AI_PROJECT_ENDPOINT (from your .env)}"
+AGENT_NAME="${WORKSHOP_RESOURCE_PREFIX}-travel-buddy"
+
+# 1. Resolve the agent's instance identity principal ID.
+AGENT_IDENTITY="$(az rest --method GET \
+  --url "${AZURE_AI_PROJECT_ENDPOINT}/agents/${AGENT_NAME}?api-version=v1" \
+  --resource "https://ai.azure.com" \
+  --query "instance_identity.principal_id" -o tsv)"
+: "${AGENT_IDENTITY:?Could not resolve the agent's instance identity — is the agent deployed?}"
+
+# 2. Let it write telemetry to the Application Insights resource from step 1.
+az role assignment create \
+  --assignee-object-id "$AGENT_IDENTITY" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Monitoring Metrics Publisher" \
+  --scope "$APP_INSIGHTS"
+```
+
+<!-- terminal -->
+```powershell
+# Set these from your .env values if this is a fresh shell.
+if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope" }
+if (-not $env:WORKSHOP_RESOURCE_PREFIX) { throw "Set WORKSHOP_RESOURCE_PREFIX (from your .env)" }
+if (-not $env:AZURE_AI_PROJECT_ENDPOINT) { throw "Set AZURE_AI_PROJECT_ENDPOINT (from your .env)" }
+$AGENT_NAME = "${env:WORKSHOP_RESOURCE_PREFIX}-travel-buddy"
+
+# 1. Resolve the agent's instance identity principal ID.
+$AGENT_IDENTITY = az rest --method GET `
+  --url "${env:AZURE_AI_PROJECT_ENDPOINT}/agents/${AGENT_NAME}?api-version=v1" `
+  --resource "https://ai.azure.com" `
+  --query "instance_identity.principal_id" -o tsv
+if (-not $AGENT_IDENTITY) { throw "Could not resolve the agent's instance identity — is the agent deployed?" }
+
+# 2. Let it write telemetry to the Application Insights resource from step 1.
+az role assignment create `
+  --assignee-object-id $AGENT_IDENTITY `
+  --assignee-principal-type ServicePrincipal `
+  --role "Monitoring Metrics Publisher" `
+  --scope $env:APP_INSIGHTS
+```
+
+> Like every other agent-identity grant in this workshop, this one belongs to the **agent**, not to an agent *version* — it survives `azd deploy`. See [Configure Microsoft Entra authentication for trace ingestion](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-ingestion-entra-authentication).
+
+**Now enforce keyless ingestion.** Both writers can authenticate with Entra ID, so it's safe to turn off key-based ingestion. Wait a few minutes for the role assignments to propagate first — flipping this switch before they land makes *every* export fail with `Forbidden`:
+
+<!-- terminal -->
+```bash
+: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1)}"
+az resource update --ids "$APP_INSIGHTS" --set properties.DisableLocalAuth=true
+```
+
+<!-- terminal -->
+```powershell
+if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1)" }
+az resource update --ids $env:APP_INSIGHTS --set properties.DisableLocalAuth=true
+```
+
+Ingestion is now **keyless**: the connection string still identifies *where* telemetry goes, but its instrumentation key no longer authorizes anything. Only Entra ID identities holding the role above can write. That's the same keyless posture as every other resource in this workshop.
+
+> **Reversible.** This setting applies to the whole Application Insights resource, so anything still publishing with an instrumentation key stops being able to write. Roll it back with the same command and `properties.DisableLocalAuth=false`.
+
+### 3. Grant yourself access to view the traces
+
+Your Foundry project access alone isn't enough: **Foundry User** sees metrics but **not** traces. Grant yourself the least-privilege **Monitoring Reader** role, scoped to the Application Insights resource. Its `*/read` permission reaches the underlying Log Analytics data, so you don't need a separate workspace grant.
+
+<!-- terminal -->
+```bash
+# APP_INSIGHTS is the resource ID you set in step 1.
+: "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope}"
+USER_ID="$(az ad signed-in-user show --query id -o tsv)"
+az role assignment create --assignee "$USER_ID" --role "Monitoring Reader" --scope "$APP_INSIGHTS"
+```
+
+<!-- terminal -->
+```powershell
+# PowerShell — $env:APP_INSIGHTS is the resource ID you set in step 1.
+if (-not $env:APP_INSIGHTS) { throw "Set APP_INSIGHTS first (step 1) — an empty scope would grant at subscription scope" }
+$USER_ID = az ad signed-in-user show --query id -o tsv
+az role assignment create --assignee $USER_ID --role "Monitoring Reader" --scope $env:APP_INSIGHTS
+```
+
+Prefer the portal? On the Application Insights resource open **Access control (IAM)** → **Add role assignment** → **Monitoring Reader** → assign it to yourself. (Working straight from the Log Analytics workspace instead? **Log Analytics Reader** at the workspace scope also works.)
+
+### 4. Let the project read telemetry back (for evaluations)
+
+If you plan to use Foundry's **evaluations** feature — which reads your agent's telemetry back out of Application Insights — the **project's managed identity** needs read access to those traces. The trace data physically lives in the **Log Analytics workspace** behind Application Insights, so grant the **Log Analytics Reader** role at **both** scopes: the **Application Insights** resource *and* its **linked Log Analytics workspace**. That two-scope grant is what Microsoft's trace-evaluation guidance prescribes; a single-scope grant can leave evaluations unable to read the traces. Just *viewing* traces in step 5 doesn't need this grant — it's specifically for the project reading telemetry on your behalf.
+
+Assign **Log Analytics Reader** to the project's managed identity on **each** of these two resources (the project identity is selectable by name):
+
+- the **Application Insights** resource you connected in step 1, and
+- the **Log Analytics workspace** it's linked to (from Application Insights, open **Overview** and follow the **Workspace** link).
+
+For each resource: **Access control (IAM)** → **Add role assignment** → role **Log Analytics Reader** (**Job function roles** tab) → Members **Managed identity** → your **Foundry project** → **Review + assign**.
+
+> **Why the project and not the agent?** *Writing* traces involves both identities (step 2), but *reading* telemetry back for evaluations is a **project** operation: Foundry queries Application Insights as the project's **managed identity**, never as the agent's. So this grant goes to the project identity only.
+
+Prefer the CLI? Copy the project's managed-identity **Object (principal) ID** from the project's **Identity** page in the portal, then assign the role at **both** scopes:
+
+<!-- terminal -->
+```bash
+PROJECT_MI_ID="<project-managed-identity-object-id>"   # from the project's Identity page
+APP_INSIGHTS="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"   # same as step 1
+WORKSPACE="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace-name>"
+
+# Grant Log Analytics Reader at BOTH scopes: the App Insights resource and its linked workspace.
+for SCOPE in "$APP_INSIGHTS" "$WORKSPACE"; do
+  : "${SCOPE:?Both resource IDs must be set — an empty scope would grant at subscription scope}"
+  az role assignment create \
+    --assignee-object-id "$PROJECT_MI_ID" \
+    --assignee-principal-type ServicePrincipal \
+    --role "Log Analytics Reader" \
+    --scope "$SCOPE"
+done
+```
+
+<!-- terminal -->
+```powershell
+# PowerShell
+$PROJECT_MI_ID = "<project-managed-identity-object-id>"   # from the project's Identity page
+$APP_INSIGHTS = "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<appinsights-name>"   # same as step 1
+$WORKSPACE = "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<workspace-name>"
+
+# Grant Log Analytics Reader at BOTH scopes: the App Insights resource and its linked workspace.
+foreach ($SCOPE in @($APP_INSIGHTS, $WORKSPACE)) {
+  if (-not $SCOPE) { throw "Both resource IDs must be set — an empty scope would grant at subscription scope" }
+  az role assignment create `
+    --assignee-object-id $PROJECT_MI_ID `
+    --assignee-principal-type ServicePrincipal `
+    --role "Log Analytics Reader" `
+    --scope $SCOPE
+}
+```
+
+> **Why `--assignee-object-id` and not `--assignee`?** The plain `--assignee` flag makes the CLI resolve the identity through Microsoft Graph, which often fails for a project managed identity (*"Cannot find user or service principal in graph database"*). Passing the object ID with `--assignee-principal-type ServicePrincipal` writes straight to Azure Resource Manager and skips that lookup.
+
+> **Evaluations still find no traces?** If your Log Analytics tables are set to a **Protected** access level, Log Analytics Reader can't read them — also assign **Privileged Monitoring Data Reader** to the project identity at the same two scopes.
+
+### 5. Generate traffic, then read the traces
+
+> **Heads up — traces capture prompt and tool content by default.** When deployed, the hosting runtime defaults `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `true`, so the spans you're about to generate include prompts, tool arguments, and model responses. That's great for debugging — and it's what content-based **evaluations** (step 4) read — but treat traces as **sensitive production data** and apply the same access controls you'd give logs. To record only structure (span names, durations, token counts, status) and redact content, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `"false"` under `template.environment_variables` in `travel_assistant/agent.manifest.yaml` (and `agent.yaml`'s `environment_variables` for local runs), then **re-run `azd ai agent init` to refresh the deployed snapshot** (see the deploy section above) and `azd deploy`. Redacting content disables content-based quality evaluators, so keep it on only while you need evaluations. Either way, never put secrets in prompts or tool arguments.
+
+1. Make sure TravelBuddy is deployed — see **item 5 of [Run and deploy TravelBuddy](#run-and-deploy-travelbuddy)** earlier in this step. Already deployed before you connected Application Insights? No redeploy needed — tracing is enabled at the project level.
+2. Invoke it a few times to produce spans — reuse the [Try it](#try-it) prompts:
+
+   <!-- terminal -->
+   ```bash
+   azd ai agent invoke "Compare current weather in Lisbon, Reykjavik, and Tokyo."
+   ```
+
+3. In the Foundry portal open **Agents → Traces**, wait a minute, and refresh. Select a trace to step through the `invoke_agent` → `chat` → `execute_tool` spans and watch each tool call, its arguments, and its result. The same data also lands in the connected Application Insights resource, so you can query it in **Transaction search** or with KQL.
+
+> **`Forbidden`, `The Agent/SDK does not have permissions to send telemetry to this resource`, or live-metrics publish errors?** Ingestion is enforcing Entra ID but the exporting identity has no **Monitoring Metrics Publisher** role. Confirm **both** identities from step 2 hold it on the Application Insights resource — the project managed identity *and* the agent's instance identity. The agent identity is the one people miss, and it's the one that fails after `azd deploy`:
+>
+> <!-- terminal -->
+> ```bash
+> : "${APP_INSIGHTS:?Set APP_INSIGHTS first (step 1) — an empty scope would query the wrong resource}"
+> az role assignment list --scope "$APP_INSIGHTS" \
+>   --query "[?roleDefinitionName=='Monitoring Metrics Publisher'].principalId" -o tsv
+> ```
+>
+> Expect **two** principal IDs — the project managed identity and the agent's instance identity. Role assignments take a few minutes to propagate. If you disabled local authentication before the grants landed, that's the whole cause — the assignments fix it, no redeploy needed.
+
+**References:**
+
+- [Set up tracing in Microsoft Foundry](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-agent-setup) — connect Application Insights and view traces (no code changes required).
+- [Configure Microsoft Entra authentication for trace ingestion (preview)](https://learn.microsoft.com/azure/foundry/observability/how-to/trace-ingestion-entra-authentication) — the keyless ingestion path used above: **Auth type = Project Managed Identity**, local authentication disabled, and **Monitoring Metrics Publisher** for the *agent* identity so sandbox code can emit traces too.
+- [Troubleshoot evaluation and observability issues](https://learn.microsoft.com/azure/foundry/observability/how-to/troubleshooting#project-managed-identity-is-missing-trace-read-permissions) — the exact grant the project's managed identity needs to read traces for evaluations: **Log Analytics Reader on both the Application Insights resource and its linked Log Analytics workspace** (plus Privileged Monitoring Data Reader if the tables are protected).
+- [Hosted agent permissions — Agent observability](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agent-permissions#agent-observability) — Microsoft's least-privilege roles for **viewing** telemetry, and the source of the **Monitoring Reader** guidance above (its `*/read` reaches the underlying Log Analytics data without a separate workspace grant).
+- [Observability in the Agent Framework](https://learn.microsoft.com/agent-framework/agents/observability) — the built-in GenAI instrumentation and the `invoke_agent` / `chat` / `execute_tool` spans.
 
 ## Solution
 
-> If you get stuck: [`.workshop/solutions/01-basic/`](.workshop/solutions/01-basic/)
+> If you get stuck: [`.workshop/solutions/02-tools/`](.workshop/solutions/02-tools/)
 
 ## Upstream sample
 
-> This step is based on the upstream [`01-basic`](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/01-basic) sample.
+> Based on the upstream [`02-tools`](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/02-tools) sample.
 
 
 ---
@@ -323,13 +648,13 @@ Whichever option you picked, try a few prompts:
 
 ## ✅ Done with this step? Push to advance.
 
-**Next:** Step 02 — Function tools
+**Next:** Step 03 — MCP integration
 
-Commit the files you created or edited in this step and push them to `main`. The push automatically loads Step 02 — there is no button to click.
+Commit the files you created or edited in this step and push them to `main`. The push automatically loads Step 03 — there is no button to click.
 
 ```bash
 git add -A
-git commit -m "Complete step 1"
+git commit -m "Complete step 2"
 git push
 ```
 
@@ -337,7 +662,7 @@ After the **Advance workshop on push to main** Action finishes, run **`git pull`
 
 > Each push to `main` advances the workshop by exactly **one** step, so push once — when this step is done.
 
-> **Prefer to stay local?** Run `python .workshop/scripts/advance_step.py --expected-current-step 1 --auto-commit` (or `make advance`) instead. That advances locally and records it in the same commit, so your next push won't advance again. See [Working fully locally](.workshop/docs/steps/00-intro.md#5-working-fully-locally-no-github-actions).
+> **Prefer to stay local?** Run `python .workshop/scripts/advance_step.py --expected-current-step 2 --auto-commit` (or `make advance`) instead. That advances locally and records it in the same commit, so your next push won't advance again. See [Working fully locally](.workshop/docs/steps/00-intro.md#5-working-fully-locally-no-github-actions).
 
 <sub>Made a mistake on this step? Re-lay its clean starter files with the [Reset current step](https://github.com/AdityaPadhy/ai-workshop-project/actions/workflows/reset-current-step.yml) workflow, or run `python .workshop/scripts/advance_step.py --reset-current --auto-commit` locally — you stay on this step. To start the whole workshop over instead, use [Reset workshop](https://github.com/AdityaPadhy/ai-workshop-project/actions/workflows/reset-workshop.yml) or `python .workshop/scripts/advance_step.py --reset --auto-commit`.</sub>
 
