@@ -15,8 +15,9 @@
 # `name` and in the WORKSHOP_RESOURCE_PREFIX environment variable below.
 name: travel-buddy
 description: >
-  TravelBuddy is an Agent Framework hosted agent with local Python function
-  tools for destination weather, local time, and currency conversion.
+  TravelBuddy is an Agent Framework hosted agent with local Python function tools
+  for weather, local time, and currency, plus an OctoTrip Flights MCP connection for
+  live flight search.
 metadata:
   tags:
     - Agent Framework
@@ -25,6 +26,7 @@ metadata:
     - Responses Protocol
     - Travel Assistant
     - Function Tools
+    - MCP Tools
   tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
     - name: get_weather
       description: Returns mock destination weather for a city and optional date.
@@ -40,7 +42,11 @@ metadata:
       parameters:
         amount: float
         from_currency: string
-        to_currency: string  
+        to_currency: string 
+    - name: octotrip-flights         # <-- added: the remote MCP tool group
+      description: OctoTrip Flights MCP server for live flight search.
+      type: mcp
+      url: ${MCP_SERVER_URL}     
 template:
   name: travel-buddy
   kind: hosted
@@ -54,6 +60,11 @@ template:
       value: ${AZURE_AI_MODEL_DEPLOYMENT_NAME}
     - name: WORKSHOP_RESOURCE_PREFIX
       value: ${WORKSHOP_RESOURCE_PREFIX}
+    - name: MCP_SERVER_LABEL         # <-- added
+      value: ${MCP_SERVER_LABEL}
+    - name: MCP_SERVER_URL           # <-- added
+      value: ${MCP_SERVER_URL}
+    
 # No provisioned resources: you already deployed a model in setup (Step 0), and the
 # agent selects it at runtime through the AZURE_AI_MODEL_DEPLOYMENT_NAME env var
 # above — so we don't declare a `kind: model` resource for azd to create.

@@ -30,7 +30,11 @@ def main() -> None:
         client=client,
         name="travel-buddy",
         instructions="a friendly travel assistant that gives practical, concise trip-planning advice with local context, budget awareness, and safety-minded tips",
-        tools=[get_weather, get_local_time, convert_currency],  # <-- add this line
+        tools=[get_weather, get_local_time, convert_currency, client.get_mcp_tool(                          # <-- add this entry
+            name=os.environ["MCP_SERVER_LABEL"],
+            url=os.environ["MCP_SERVER_URL"],
+            approval_mode="never_require",
+        ),],  # <-- add this line
         default_options={"store": False},
     )
 
