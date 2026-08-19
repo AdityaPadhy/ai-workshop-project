@@ -31,6 +31,8 @@ metadata:
     - MCP Tools
     - Toolbox tools
     - RAG
+    - Skills
+    - Foundry Skills
    
   tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
     - name: get_weather
@@ -59,7 +61,18 @@ metadata:
         Azure AI Search retrieval over the curated destinations index; injects the
         top-k matching destination records into context before each turn.
       type: azure_ai_search
-      endpoint: ${AZURE_AI_SEARCH_ENDPOINT}         
+      endpoint: ${AZURE_AI_SEARCH_ENDPOINT}   
+    - name: travel-guide
+      description: >
+        Local Skill that renders a grounded, downloadable PDF travel guide (with a
+        day-by-day itinerary) via scripts/create_travel_guide.py.
+      type: skill    
+    - name: response-guardrails
+      description: >
+        Foundry Skill downloaded from the project at startup; shareable
+        across agents and required by this step. Uploaded out-of-band via
+        foundry_skills/provision_skills.py.
+      type: skill      
 template:
   name: travel-buddy
   kind: hosted
@@ -79,6 +92,8 @@ template:
       value: ${AZURE_AI_SEARCH_ENDPOINT}
     - name: AZURE_AI_SEARCH_INDEX_NAME   # <-- added
       value: ${AZURE_AI_SEARCH_INDEX_NAME}  
+    - name: FOUNDRY_SKILL_NAMES
+      value: ${FOUNDRY_SKILL_NAMES}  
     
 # No provisioned resources: you already deployed a model in setup (Step 0), and the
 # agent selects it at runtime through the AZURE_AI_MODEL_DEPLOYMENT_NAME env var
