@@ -18,7 +18,8 @@ description: >
   TravelBuddy is an Agent Framework hosted agent with local Python function tools
   for weather, local time, and currency, plus a Foundry Toolbox that bundles web
   search, Code Interpreter, and the OctoTrip flights MCP server behind one
-  project-managed endpoint.
+  project-managed endpoint, and RAG grounding over a curated
+  destinations index in Azure AI Search.
 metadata:
   tags:
     - Agent Framework
@@ -28,7 +29,8 @@ metadata:
     - Travel Assistant
     - Function Tools
     - MCP Tools
-    - Toolbox Tools          # <-- added
+    - Toolbox tools
+    - RAG
    
   tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
     - name: get_weather
@@ -51,7 +53,13 @@ metadata:
         Foundry Toolbox bundling web_search, code_interpreter, and the OctoTrip
         flights MCP server, consumed from one project-managed endpoint.
       type: toolbox
-      endpoint: ${TOOLBOX_ENDPOINT}         
+      endpoint: ${TOOLBOX_ENDPOINT}  
+    - name: travelbuddy_destinations     # <-- added: the retrieval surface
+      description: >
+        Azure AI Search retrieval over the curated destinations index; injects the
+        top-k matching destination records into context before each turn.
+      type: azure_ai_search
+      endpoint: ${AZURE_AI_SEARCH_ENDPOINT}         
 template:
   name: travel-buddy
   kind: hosted
@@ -67,6 +75,10 @@ template:
       value: ${WORKSHOP_RESOURCE_PREFIX}
     - name: TOOLBOX_ENDPOINT         # <-- added
       value: ${TOOLBOX_ENDPOINT}
+    - name: AZURE_AI_SEARCH_ENDPOINT     # <-- added
+      value: ${AZURE_AI_SEARCH_ENDPOINT}
+    - name: AZURE_AI_SEARCH_INDEX_NAME   # <-- added
+      value: ${AZURE_AI_SEARCH_INDEX_NAME}  
     
 # No provisioned resources: you already deployed a model in setup (Step 0), and the
 # agent selects it at runtime through the AZURE_AI_MODEL_DEPLOYMENT_NAME env var

@@ -25,3 +25,7 @@ environment_variables:
     value: ${WORKSHOP_RESOURCE_PREFIX}
   - name: TOOLBOX_ENDPOINT          # <-- added
     value: ${TOOLBOX_ENDPOINT}  
+  - name: AZURE_AI_SEARCH_ENDPOINT
+    value: ${AZURE_AI_SEARCH_ENDPOINT}
+  - name: AZURE_AI_SEARCH_INDEX_NAME
+    value: ${AZURE_AI_SEARCH_INDEX_NAME}  
