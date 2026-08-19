@@ -28,6 +28,11 @@ services:
             TravelBuddy is an Agent Framework hosted agent with local Python function tools for weather, local time, and currency, plus a Foundry Toolbox that bundles web search, Code Interpreter, and the OctoTrip flights MCP server behind one project-managed endpoint, and RAG grounding over a curated destinations index in Azure AI Search.
         kind: hosted
         metadata:
+            group_chat:
+                manager: Coordinator
+                specialists:
+                    - FlightsSpecialist
+                    - HotelsSpecialist
             tags:
                 - Agent Framework
                 - AI Agent Hosting
@@ -39,7 +44,7 @@ services:
                 - Toolbox tools
                 - RAG
                 - Skills
-                - Foundry Skills
+                - Multi-Agent
             tool_declarations:
                 - description: Returns mock destination weather for a city and optional date.
                   name: get_weather

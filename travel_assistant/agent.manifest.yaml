@@ -32,7 +32,10 @@ metadata:
     - Toolbox tools
     - RAG
     - Skills
-    - Foundry Skills
+    - Multi-Agent
+  group_chat:
+    manager: Coordinator
+    specialists: [FlightsSpecialist, HotelsSpecialist]  
    
   tool_declarations:     # <-- added: describes the three tools for anyone browsing the agent
     - name: get_weather
