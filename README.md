@@ -2,10 +2,10 @@
 
 Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses).
 
-> **Progress:** Step `07` of `9` — **Multi-agent**  
-> ▰▰▰▰▰▰▰▱▱▱
+> **Progress:** Step `08` of `9` — **Workflow (experimental)**  
+> ▰▰▰▰▰▰▰▰▱▱
 
-<!-- step: 07 -->
+<!-- step: 08 -->
 
 <details>
 <summary>Workshop map</summary>
@@ -17,8 +17,8 @@ Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/fou
 - Step 04 — Foundry Toolbox ✅
 - Step 05 — RAG (Azure AI Search) ✅
 - Step 06 — Skills ✅
-- **Step 07 — Multi-agent**
-- Step 08 — Workflow (experimental)
+- Step 07 — Multi-agent ✅
+- **Step 08 — Workflow (experimental)**
 - Step 09 — Memory (experimental)
 - Step 99 — Cleanup
 
@@ -27,154 +27,231 @@ Built on the upstream [foundry-samples](https://github.com/microsoft-foundry/fou
 If something looks broken see [Troubleshooting](.workshop/docs/steps/00-intro.md#troubleshooting).
 
 
-# Step 7 — Multi-agent: a group chat of specialists
+# Step 8 — Durable orchestration with workflows
 
-> **Goal:** split TravelBuddy into a **Coordinator** (the group chat *manager*) plus **Flights / Hotels / Activities** specialists. Each round the Coordinator picks which specialist speaks next, then synthesizes one final answer — while the Coordinator and its specialists each reuse a slice of the Step 6 tools, toolbox, RAG, and skills.
+> 🧪 **Experimental** — this step has not been fully tested yet. Treat it as a preview and expect rough edges.
 
-> **Tip — give this step a capable model.** Step 7 is the most demanding step for the model: the manager and three specialists share one conversation, and every round replays the accumulated history plus each specialist's tool-grounded response, so the context grows fast. A small `-mini` deployment (for example `gpt-4o-mini`) often picks the wrong speaker, terminates too early, or loops. If routing misbehaves, point `AZURE_AI_MODEL_DEPLOYMENT_NAME` at a full-size model — for example a `gpt-5.4` deployment rather than `gpt-5.4-mini` — and re-run. It's a deployment-name change only; no code changes.
+> **Goal:** re-express Step 7's trip planning as an Agent Framework **workflow** — a fixed graph that is observable, restart-safe via checkpoints, and can pause for human approval — while reusing the exact same specialists.
 
 ## What you'll learn
 
-- The Agent Framework's native multi-agent primitives — `SequentialBuilder`, `ConcurrentBuilder`, `HandoffBuilder`, and `GroupChatBuilder`
-- When a **manager-led group chat** fits: a coordinator LLM chooses the next expert each round and decides when the plan is done
-- How to give each agent a narrow capability slice from the carried stack (tools, toolbox, RAG, skills)
-- How `workflow.as_agent()` exposes the whole graph as one hosted agent, so deployment is unchanged (`resources: []`, no `azd provision`)
+- The workflow graph model: **executors**, **edges**, **supersteps**, and fan-out / fan-in
+- How **checkpoints** make a long-running plan restart-safe (`FileCheckpointStorage`)
+- How to expose a whole workflow as one hosted agent with `workflow.as_agent()` — so deployment is unchanged
+- How a **human approval gate** works with `ctx.request_info()` + `@response_handler`, and how it surfaces when the workflow is hosted
 
 ## What's already in the repo
 
-- Everything from Steps 1–6 in `travel_assistant/` — the three function tools, the Foundry Toolbox, the Step 5 RAG provider, and the Step 6 itinerary skill. Nothing was deleted when you advanced.
-- `travel_toolbox/toolbox.yaml` — the toolbox definition, still a sibling of `travel_assistant/`.
-- `travel_assistant/agents/{flights,hotels,activities}/` — the per-specialist config slices (`agent.yaml` + `agent.manifest.yaml`), delivered complete when you advanced. You **read** these; you don't edit them.
-- `travel_assistant/coordinator.py` — the group chat, delivered **almost complete**: the instruction constants, the Step 5 RAG provider, the Step 6 skills provider and trusted script runner, the manager `Coordinator`, the `FlightsSpecialist` worked example, and the `GroupChatBuilder` graph are all wired for you. One `TODO` is left — adding the Hotels and Activities specialists.
+- Everything from Steps 1–7 in `travel_assistant/` — the specialists, tools, toolbox, RAG, and skill.
+- `travel_assistant/coordinator.py` — the Step 7 group chat. In this step you extract the specialist constructors into reusable factories so the workflow builds the **same** agents.
+- `travel_toolbox/toolbox.yaml` — unchanged.
 
-In this step you make **delta-only** edits: read the per-specialist config slices under `agents/`, fill in the single `TODO` in `coordinator.py` (the two remaining specialists), and point `main.py` at the Coordinator. There are **no** new environment variables and no manifest env changes — only a `Multi-Agent` tag and a `group_chat` metadata block.
+This step adds a `workflow.py`, refactors `coordinator.py` to expose factories, repoints `main.py`, and adds a `Workflows` tag. There are **no** new environment variables and no new Azure resources.
 
 ## Concept (5-min read)
 
-A single-agent assistant is the simplest shape: one instruction set, one tool list, one history, one model deciding every step. That's great while TravelBuddy's job is narrow. As it grows, the prompt starts carrying too many responsibilities — flight trade-offs, hotel constraints, destination grounding, itinerary generation, web lookups, and user-facing coordination all at once.
+Step 7 was **runtime collaboration**: the Coordinator decided, turn by turn, which specialist should answer next. That's the right shape when the path is user-driven and unknown in advance.
 
-A **multi-agent runtime** keeps one conversation but splits responsibilities into focused agents. A **manager** agent — our **Coordinator** — reads the traveler's request and, each round, decides which specialist should speak next. A specialist uses only the capabilities it needs, adds its part to the shared conversation, and returns control to the manager. When the plan is complete, the manager stops the chat and writes the final answer.
+A **workflow** is the opposite trade-off. You choose it when the process has a **known shape**, must survive restarts, or needs an explicit review before a costly action. Trip planning fits perfectly: gather preferences → ask each specialist → consolidate a draft → (optionally) get approval → finalize. The graph makes that process repeatable and inspectable, at the cost of the conversational flexibility the group chat gave you.
 
-**Group chat vs. the other shapes.** The Agent Framework gives you several orchestration builders:
+**The graph model.** A workflow is built from **executors** (nodes) connected by **edges**. Executors can be `AgentExecutor` (an agent wrapped as a node) or your own `Executor` subclasses with `@handler` methods. The engine runs in **supersteps**: every executor ready at the start of a superstep runs, their messages are delivered, and the next superstep begins. Fanning three edges out of one node runs those branches **concurrently**; fanning several edges into one node lets it aggregate.
 
-- `SequentialBuilder` passes work through agents in a fixed order.
-- `ConcurrentBuilder` fans the same task out to several agents and aggregates the results.
-- `HandoffBuilder` lets the *active* agent transfer control to another participant — a peer-to-peer, human-in-the-loop shape.
-- `GroupChatBuilder` is the **manager-led** shape we use here: a central orchestrator sits between the participants and, every round, selects the next speaker (or ends the chat). All routing decisions flow through one place.
+**Checkpoints.** When a `checkpoint_storage` is supplied, the engine writes a checkpoint at the end of each superstep, capturing executor state, pending messages, and pending requests. If the process dies, or the user says "replan with a lower budget," you can resume from a checkpoint instead of redoing completed work. Your executors persist their own local state by overriding `on_checkpoint_save` / `on_checkpoint_restore`.
 
-Group chat wins when you want a single brain deciding *who's next* from the whole conversation, and a clean, predictable completion each turn. Because the manager explicitly decides to **terminate**, each hosted turn finishes cleanly and the **next** question just continues the same conversation — which makes group chat a natural fit for a hosted, multi-turn agent. A **workflow** (Step 8) wins when the process is known ahead of time: gather → specialists → approve → finalize. This step is manager-led collaboration; Step 8 re-expresses the same trip-planning scenario as a durable, observable pipeline.
+**Human-in-the-loop.** An executor calls `ctx.request_info(request_data=..., response_type=...)` to pause and ask an outside party a question; a `@response_handler` method resumes the graph when the answer arrives. Locally you drive this with a streaming loop that feeds `responses=` back into `workflow.run(...)`. When the workflow is **hosted as an agent**, the same request is surfaced to the caller as a **function call** — so the pattern still works over the Responses protocol, it just arrives as a tool call rather than a plain prompt.
 
-The important design choice isn't the number of agents — it's the **boundary** around each one. Each specialist gets a short purpose statement (its `description`, which the manager reads when choosing a speaker), a narrow capability slice, and a clear rule about staying in its lane. Those slices come straight from the carried stack:
+**Hosting.** `workflow.as_agent()` wraps the whole graph as a single agent, validated so its start executor accepts the input, with a session managing conversation state. That means hosting and deployment are identical to every earlier step: one agent, `ResponsesHostServer`, `resources: []`. As in Step 7, all the executors run **in-process** inside that one hosted agent — the same in-process vs. remote-A2A trade-off applies if you ever need a step owned or scaled independently.
 
 ```mermaid
-graph TD
-    User[Traveler] --> Coordinator[Coordinator — manager]
-    Coordinator -- selects: flights, routes, timing --> Flights[FlightsSpecialist]
-    Coordinator -- selects: lodging, neighbourhood, budget --> Hotels[HotelsSpecialist]
-    Coordinator -- selects: experiences, day trips, itinerary --> Activities[ActivitiesSpecialist]
-    Flights -- adds its part --> Coordinator
-    Hotels -- adds its part --> Coordinator
-    Activities -- adds its part --> Coordinator
-    Coordinator -- terminates + final answer --> User
-    Flights -. weather + local time + currency + toolbox flights + fares .-> FT[ ]
-    Hotels -. currency + toolbox web + RAG .-> HT[ ]
-    Activities -. toolbox web + RAG + travel-guide + guardrails skills .-> AT[ ]
+flowchart LR
+    start((start)) --> gather[gather_preferences]
+    gather --> flights[flights]
+    gather --> hotels[hotels]
+    gather --> activities[activities]
+    flights --> consolidate[[consolidate 💾 checkpoint]]
+    hotels --> consolidate
+    activities --> consolidate
+    consolidate --> finalize[finalize_itinerary]
+    finalize --> finish((end))
 ```
 
-**One hosted agent, or many? (in-process vs. A2A).** Notice all four agents live in the *same* process and share one `FoundryChatClient`; `workflow.as_agent()` then wraps the whole graph as a **single** hosted agent — so deployment is unchanged (`resources: []`, no `azd provision`). The manager's speaker selections and the participant runs are in-memory calls: fast, simple, and easy to trace. The alternative is to deploy each specialist as its **own** hosted agent and have the Coordinator reach them remotely over the **A2A (Agent-to-Agent) protocol** (or expose one deployed agent as a function tool of another). Remote agents can be scaled, versioned, owned, and reused independently — even across teams, languages, or vendors — but every round now pays a network hop plus auth and serialization cost, and you operate N deployments instead of one. Rule of thumb: keep chatty, tightly-coupled specialists **in-process** (what we do here); reach for **A2A** only when a specialist genuinely needs to be independently deployed or reused. The two compose — a hosted agent like this one can itself be a node in a larger A2A mesh.
+The doubled `consolidate` node is where the checkpoint is written — the safe resume point. The dashed approval gate (below) slots between `consolidate` and `finalize` when you enable it.
 
 **Learn more**
 
-- [Group chat orchestration in Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/user-guide/agent-orchestration/group-chat)
-- [Agent orchestration overview](https://learn.microsoft.com/agent-framework/user-guide/agent-orchestration/)
-- [Using workflows as agents](https://learn.microsoft.com/agent-framework/user-guide/workflows/workflows-as-agents)
-- [Agent-to-Agent (A2A) protocol in Microsoft Agent Framework](https://learn.microsoft.com/agent-framework/journey/agent-to-agent)
-- [Connect to an A2A agent endpoint from Foundry Agent Service](https://learn.microsoft.com/azure/foundry/agents/how-to/tools/agent-to-agent)
-- [Agent Framework orchestrations gallery](https://github.com/microsoft/agent-framework/tree/main/python/samples/03-workflows/orchestrations) — the `group_chat_*.py` samples this step follows (a `GroupChatBuilder` graph exposed through `workflow.as_agent()`).
+- [Agent Framework workflows overview](https://learn.microsoft.com/agent-framework/workflows/)
+- [Checkpoints](https://learn.microsoft.com/agent-framework/workflows/checkpoints)
+- [Human-in-the-loop](https://learn.microsoft.com/agent-framework/workflows/human-in-the-loop)
+- [Agent executor & context modes](https://learn.microsoft.com/agent-framework/workflows/advanced/agent-executor)
 
 ## Steps
 
-### 1. Read the specialist config slices
+### 1. Extract the specialist factories
 
-The per-specialist config slices are **already in the repo** — one folder per specialist under `travel_assistant/agents/`, delivered complete when you advanced. Each folder holds an `agent.yaml` (the role, `description`, and `instructions`) and an `agent.manifest.yaml` (the capability slice: `tools`, `rag`, `skills`). You don't edit them here — **open and read them**, because in the next section you translate each one into the code that builds that specialist.
+Step 7 built the specialists inline inside `build_travel_coordinator()`. Extract that construction into factories and a shared client helper, then delete `build_travel_coordinator()`: Step 8 replaces the Step 7 group chat with the durable **workflow**, which builds the **same** agents from these factories. The factories are now the single source of truth the workflow reads.
 
-```text
-travel_assistant/agents/
-├── flights/     { agent.yaml, agent.manifest.yaml }   # weather + local time + currency + toolbox flights (fares)
-├── hotels/      { agent.yaml, agent.manifest.yaml }   # currency + toolbox web + destinations RAG
-└── activities/  { agent.yaml, agent.manifest.yaml }   # toolbox web + destinations RAG + travel-guide/guardrails skills
+As in Step 7, the `agents/*/agent.yaml` slices remain **documentation** — nothing loads them at runtime. The workflow imports these Python factories, so `coordinator.py` stays the single executable source of truth for what each specialist is and may touch.
+
+```python
+# travel_assistant/coordinator.py (delta)
+def make_client(credential=None) -> FoundryChatClient:
+    return FoundryChatClient(
+        project_endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"],
+        credential=credential or DefaultAzureCredential(),
+    )
+
+
+def create_flights_agent(client, credential=None) -> Agent:
+    credential = credential or DefaultAzureCredential()
+    toolbox = FoundryToolbox(credential)
+    return Agent(
+        client=client, name="FlightsSpecialist",
+        instructions=FLIGHTS_INSTRUCTIONS,
+        tools=[get_weather, get_local_time, convert_currency, toolbox], default_options={"store": False},
+    )
+
+# create_hotels_agent (currency + toolbox web + RAG) and
+# create_activities_agent (toolbox web + RAG) follow the same pattern.
 ```
 
-Reading them, notice the intended boundary of each specialist:
+The point is a **single source of truth**: the workflow builds every specialist from these factories.
 
-- **Flights** — the three function tools (`get_weather`, `get_local_time`, `convert_currency`) plus the toolbox (its flight search); it always reports concrete fares. No RAG, no skills.
-- **Hotels** — `convert_currency`, the toolbox (its web search for live rates and availability signals), and the destinations index (RAG).
-- **Activities** — the toolbox (web search), the destinations index (RAG), **and** the two skills that shape the final deliverable: the LOCAL `travel-guide` skill (renders the shareable PDF trip guide) and the Foundry `response-guardrails` skill. In this group chat the skills ride on the **Activities specialist**, not the Coordinator/manager (see the callout below).
+### 2. Create `travel_assistant/workflow.py`
 
-Three small slices make each specialist's intended boundary explicit and easy to review — they're the architecture spec a teammate reads before touching the graph.
+The workflow has three custom executors plus agent nodes. `GatherPreferences` fans the request out to all three specialists; `Consolidate` aggregates their answers, checkpoints the draft, then sends the finalize prompt; `finalize_itinerary` is an `AgentExecutor` that writes the plan and owns the final deliverable, using the `travel-guide` skill to render the shareable PDF and the `response-guardrails` skill to check the answer. This is the payoff over Step 7: there the group chat Coordinator was the manager: every round it returned a structured routing decision rather than a free, tool-driven answer, so a deliverable-shaping skill didn't belong on it — the skills had to ride on the Activities leaf and only guarded that leaf's output. A dedicated `finalize` node owns the deliverable outright and guards the actual final answer.
 
-> **The Foundry skill is optional here.** The **Activities** specialist owns the two skills that shape the final answer — the LOCAL `travel-guide` skill (renders the shareable PDF trip guide) and the Foundry `response-guardrails` skill carried from Step 6 — and the delivered `coordinator.py` (like the checked-in solution) is the **Foundry-enabled reference**: its `_build_skills_provider`, `ACTIVITIES_INSTRUCTIONS`, and `.env.example` all wire the guardrails skill in and treat it as required. If you built it in Step 6, keep it as delivered. If you **skipped** the Foundry skill (for example your Foundry project can't allow public network access — see Step 6), make two small edits in `coordinator.py`: replace the body of `_build_skills_provider` with your Step 6 *local-only* provider, and drop the `response-guardrails` line from `ACTIVITIES_INSTRUCTIONS` (leaving `FOUNDRY_SKILL_NAMES` unset). The local `travel-guide` skill still renders the PDF and nothing else in this step depends on the Foundry skill.
+```python
+# travel_assistant/workflow.py
+from agent_framework import (
+    Agent, AgentExecutor, AgentExecutorRequest, AgentExecutorResponse,
+    Executor, FileCheckpointStorage, Message, WorkflowBuilder, WorkflowContext,
+    handler, response_handler,
+)
 
-> **Why the skills ride on Activities, not the Coordinator.** A skills provider is a **context provider that registers its skill *tools*** on whichever agent holds it. But the Coordinator here is the group chat **manager**: `GroupChatBuilder` invokes it each round for a *structured* routing decision (which specialist speaks next, or terminate with the final answer). You *could* attach tools or a skills provider to it — the framework doesn't strip them — but a skill it carried wouldn't reliably fire, because the manager's turn produces that routing decision, not the free, tool-driven answer that renders the PDF and runs the guardrail. The skills therefore live on the **Activities specialist** — a normal participant that runs its tools and skills freely. The trade-off: only Activities' output is guarded, not the manager's final synthesis, and the manager has to *route* the deliverable through Activities rather than being *structurally* forced to. That's a real limitation of a manager-plus-specialists chat, and it's exactly what **Step 8** fixes — its workflow adds a dedicated `finalize` node that owns the deliverable and guards the actual final answer.
+from coordinator import (
+    _build_skills_provider,
+    create_activities_agent, create_flights_agent, create_hotels_agent, make_client,
+)
 
-> **These slices are documentation, not runtime config.** Nothing loads `agent.yaml`/`agent.manifest.yaml` at run time. `coordinator.py` builds each specialist directly in Python: the `instructions:` are already string constants there, and the tool/RAG/skill slices become the `tools=[...]` and `context_providers=[...]` arguments you write in the next section. The slices are the reviewable **contract**; `coordinator.py` is the executable **source of truth**. That means they can drift, so when a specialist behaves unexpectedly, inspect `coordinator.py` first — then realign the slice so the two agree.
 
-### 2. Complete the specialists in `coordinator.py`
+class GatherPreferences(Executor):
+    def __init__(self) -> None:
+        super().__init__(id="gather_preferences")
 
-The Coordinator is the group chat **manager** — the single brain that decides which specialist speaks each round and writes the final answer. `coordinator.py` was delivered **almost complete** when you advanced: the instruction constants (already translated from the `agents/*/agent.yaml` slices), your Step 5 `_build_search_provider`, your Step 6 `run_local_skill_script` + `_build_skills_provider`, the manager `Coordinator`, and the `GroupChatBuilder` graph are all wired. `GroupChatBuilder` — from `agent_framework.orchestrations`, a separate `agent-framework-orchestrations` package already in `requirements.txt` — registers the participants, wires the manager between them, and every round asks the manager (via a structured response) who speaks next or whether to stop.
+    @handler
+    async def gather(self, request: str, ctx: WorkflowContext[AgentExecutorRequest]) -> None:
+        base = f"The user is planning a trip.\n\nUser request:\n{request}"
+        for target_id, focus in {
+            "flights": "Recommend flight approach, timing, and trade-offs.",
+            "hotels": "Recommend neighbourhoods, hotel style, and budget split.",
+            "activities": "Recommend a balanced day-by-day activity plan.",
+        }.items():
+            await ctx.send_message(
+                AgentExecutorRequest(
+                    messages=[Message(role="user", contents=[f"{base}\n\nFocus: {focus}"])],
+                    should_respond=True,
+                ),
+                target_id=target_id,
+            )
+```
 
-**Your job is the single `TODO`: turn the `agents/*` slices into the specialists.** `FlightsSpecialist` is already written in the file as the worked example; you add `HotelsSpecialist` and `ActivitiesSpecialist`. That translation *is* the lesson of this step — capability slicing is what makes a multi-agent system more than three copies of the same agent.
+`Consolidate` waits until all three specialist responses have arrived (it's invoked once per incoming edge), builds the draft, and persists node-local state for safe resume:
 
-Each specialist is a normal `Agent` — the same constructor as Steps 4–6 — with a sliced `tools` list and, where relevant, sliced `context_providers`. Each slice is a **pair** of files: `agents/<name>/agent.yaml` holds the role (name, description, instructions) and `agents/<name>/agent.manifest.yaml` holds the capabilities (tools, rag, skills). Read both and map them across:
+```python
+# travel_assistant/workflow.py
+class Consolidate(Executor):
+    def __init__(self, approval_target: str | None = None) -> None:
+        super().__init__(id="consolidate")
+        self._approval_target = approval_target
+        self._draft: DraftPlan | None = None
 
-| Slice field | `Agent(...)` argument |
-| --- | --- |
-| `agent.yaml` → `name:` | `name=` — the manager routes by name |
-| `agent.yaml` → `description:` | `description=` — feeds the manager's routing prompt |
-| `agent.yaml` → `instructions:` | `instructions=<the matching *_INSTRUCTIONS constant>` |
-| `agent.manifest.yaml` → `tools:` | `tools=[...]` — the function tools from `tools.py` plus `toolbox` |
-| `agent.manifest.yaml` → `rag:` | `context_providers=[search]` |
-| `agent.manifest.yaml` → `skills:` | `context_providers=[search, skills]` (Activities only) |
+    @handler
+    async def collect(self, response: AgentExecutorResponse, ctx: WorkflowContext[AgentExecutorRequest]) -> None:
+        draft = ctx.get_state("draft_plan", DraftPlan(session_id=ctx.get_state("session_id", "local-user")))
+        setattr(draft, response.executor_id, response.agent_response.text)  # flights/hotels/activities
+        ctx.set_state("draft_plan", draft)
+        self._draft = draft
+        if not (draft.flights and draft.hotels and draft.activities):
+            return  # still waiting for the other branches
+        consolidated = f"## Flights\n{draft.flights}\n\n## Hotels\n{draft.hotels}\n\n## Activities\n{draft.activities}\n"
+        await ctx.send_message(
+            AgentExecutorRequest(
+                messages=[Message(role="user", contents=[_finalize_prompt(consolidated)])],
+                should_respond=True,
+            ),
+            target_id="finalize_itinerary",
+        )
 
-`FlightsSpecialist` is already written in the file as the worked example. Add the other two the same way:
+    async def on_checkpoint_save(self) -> dict[str, Any]:
+        return {"draft": self._draft.__dict__ if self._draft else None}
 
-- **`hotels`** — `tools=[convert_currency, toolbox]`, `context_providers=[search]`.
-- **`activities`** — `tools=[toolbox]`, `context_providers=[search, skills]`. It owns the deliverable: the `travel-guide` PDF and the `response-guardrails` check (attached to this participant, not the manager, whose turn is only a routing decision — see the callout above).
+    async def on_checkpoint_restore(self, state: dict[str, Any]) -> None:
+        data = state.get("draft")
+        self._draft = DraftPlan(**data) if data else None
+```
 
-Give both `default_options={"store": False}`, exactly like the delivered `flights` — the hosting layer manages history, so no agent should persist its responses server-side.
+Build the graph, enable checkpointing, and expose it as an agent. `context_mode="last_agent"` keeps each specialist focused on its own slice instead of the whole transcript. `FileCheckpointStorage` deserializes checkpoints with a restricted unpickler, so the `DraftPlan` and `ApprovalRequest` dataclasses we persist must be allow-listed by their `"module:qualname"` — otherwise a resume raises on restore:
 
-**How the manager picks a speaker.** `GroupChatBuilder` builds the selection prompt for you: each round it shows the manager the conversation plus the participants' **names and `description`s**, and asks for a structured decision — the next speaker, or *terminate* with a final message. So the `description=` fields you write do the routing work here (keep them crisp), while `COORDINATOR_INSTRUCTIONS` (delivered) sets the manager's *policy*: gather order, when to finish, and how to write the final answer. You don't hand-write any speaker-selection tools.
+```python
+# travel_assistant/workflow.py
+def build_workflow(require_approval: bool = False):
+    client = make_client()
+    flights = AgentExecutor(create_flights_agent(client), id="flights", context_mode="last_agent")
+    hotels = AgentExecutor(create_hotels_agent(client), id="hotels", context_mode="last_agent")
+    activities = AgentExecutor(create_activities_agent(client), id="activities", context_mode="last_agent")
+    finalize = AgentExecutor(
+        Agent(
+            client=client, name="finalize_itinerary", instructions=FINALIZE_INSTRUCTIONS,
+            context_providers=[_build_skills_provider()],  # travel-guide PDF + response-guardrails
+            default_options={"store": False},
+        ),
+        id="finalize_itinerary", context_mode="last_agent",
+    )
+    gather, consolidate = GatherPreferences(), Consolidate()
 
-Read `COORDINATOR_INSTRUCTIONS` before you run — it's the manager's brief, and the one constant with no slice behind it: it states the role, one routing rule per specialist, "for a full trip gather flights and hotels first, then choose Activities **last**", "include Activities' guarded guide and its PDF link verbatim", and "you never call tools yourself".
+    return (
+        WorkflowBuilder(
+            name="travel_planning_workflow",
+            start_executor=gather,
+            checkpoint_storage=FileCheckpointStorage(
+                ".workshop-state/workflow-checkpoints",
+                allowed_checkpoint_types=["workflow:DraftPlan", "workflow:ApprovalRequest"],
+            ),
+            output_executors=[finalize],
+        )
+        .add_edge(gather, flights)
+        .add_edge(gather, hotels)
+        .add_edge(gather, activities)
+        .add_edge(flights, consolidate)
+        .add_edge(hotels, consolidate)
+        .add_edge(activities, consolidate)
+        .add_edge(consolidate, finalize)
+        .build()
+    )
 
-Notice its **"Plan first, ask almost never"** section, and the matching "never stop to ask" boundary in each specialist. Without them a manager-led chat degenerates into an interrogation: asked for a Tokyo trip with no departure date, the model happily terminates with "what are your dates, how many travelers, which cabin class?" and the traveler answers three questions before seeing a plan. Telling every agent to assume a sensible default — and to *label* the assumption so a follow-up can correct it — is what makes the first turn produce an actual itinerary. The split is deliberate: **specialists never ask** — a detail with no default, like the departure city, is reported as missing, not requested — while the **Coordinator may close with exactly one** no-substitute question, and only after delivering the plan it could build. Prompting a multi-agent system is mostly this: deciding what each agent does when information is missing.
 
-The pre-wired builder is what makes this a manager-led chat rather than a fixed pipeline:
+def build_workflow_agent(require_approval: bool = False) -> Agent:
+    return build_workflow(require_approval=require_approval).as_agent()
+```
 
-- `orchestrator_agent=coordinator` makes the Coordinator the manager that selects the next speaker each round.
-- `participants=[flights, hotels, activities]` are the specialists the manager can pick from — which is why the graph only runs once you've defined all three.
-- `max_rounds=40` caps the number of orchestrator rounds. The round counter is checkpoint-restored, so this cap is **cumulative across the whole conversation**, not per turn — a normal turn terminates well before it, and `40` leaves ample headroom for a multi-turn planning session while still stopping a manager that never terminates. (A very long conversation could eventually exhaust it; if a late follow-up returns a bare "max rounds reached" result, start a fresh conversation or raise the cap.)
-- `workflow.as_agent()` wraps the multi-agent runtime so the rest of the app treats it like a single hosted agent.
+Do **not** copy the specialist prompts into `workflow.py` — import the factories so Steps 7 and 8 stay aligned.
 
-**Why group chat is a clean fit for a hosted, multi-turn agent.** Each round the manager either selects a speaker or **terminates** — and when it terminates, the workflow simply *completes* (goes idle) and yields the final answer. It never parks waiting for a special reply. So when the traveler asks a **follow-up** in the same conversation, the hosting layer just restores the conversation and runs the manager again against the new message — the chat continues naturally. (This is the key difference from a peer-to-peer handoff, which pauses for human-in-the-loop input after each turn and needs extra care to resume cleanly when hosted.)
+> **Skipped the Foundry skill?** The finalize step inherits the Step 7 rule: if you left `FOUNDRY_SKILL_NAMES` unset, carry your local-only skills provider here instead of the solution's `_build_skills_provider`, and drop the `response-guardrails` line from `FINALIZE_INSTRUCTIONS`. The local `travel-guide` skill still renders the PDF.
 
-Because the toolbox is one bundle (web search + Code Interpreter + OctoTrip flights), Flights, Hotels, and Activities each receive the whole toolbox; the tighter boundary — flight search for Flights, web search for Hotels and Activities — is enforced by each specialist's instructions.
+### 3. Point `main.py` at the workflow
 
-### 3. Point `main.py` at the Coordinator
-
-`main.py` collapses to constructing the Coordinator and hosting it through the same adapter as before — everything else moved into `coordinator.py`. **Replace your Step 6 `travel_assistant/main.py` with this:**
+`main.py` hosts the workflow-as-agent through the same server as every other step:
 
 ```python
 # travel_assistant/main.py
 from agent_framework_foundry_hosting import ResponsesHostServer
 
-from coordinator import build_travel_coordinator
+from workflow import build_workflow_agent
 
 
 def main() -> None:
-    # The Coordinator + specialists group chat is exposed as a single agent, so the
-    # rest of the hosting stack is unchanged from earlier steps.
-    agent = build_travel_coordinator()
+    agent = build_workflow_agent(require_approval=False)
     ResponsesHostServer(agent).run()
 
 
@@ -182,13 +259,9 @@ if __name__ == "__main__":
     main()
 ```
 
-Your Step 6 skills plumbing — `run_local_skill_script`, `TrustedSkillsProvider`, and the skill-download helpers — now lives in `coordinator.py`, so deleting the old `main.py` body drops nothing you still need. `tools.py`, `skills/`, and the manifests stay exactly where they are.
-
 ### 4. Update the manifest
 
-Metadata-only: append the `Multi-Agent` tag to your existing `tags` (if you kept the Foundry skill you'll also already have `Foundry Skills` from Step 6), update the `description` to mention the group chat, and add a `group_chat` block naming the manager + specialists. No new `template.environment_variables`; `resources` stays `[]`.
-
-> **Keep `description` under 512 characters.** Foundry validates the agent description on deploy and rejects anything longer with `400 invalid_payload — String length … exceeds maximum 512`. The description has grown with every step, so trim it as you extend it rather than only appending.
+Metadata-only: append the `Workflows` tag, update the `description`, and add a `workflow` block describing the graph. No new `template.environment_variables`; `resources` stays `[]`.
 
 ```yaml
 # travel_assistant/agent.manifest.yaml (delta)
@@ -205,14 +278,61 @@ metadata:
     - RAG
     - Skills
     - Multi-Agent
-  group_chat:
-    manager: Coordinator
-    specialists: [FlightsSpecialist, HotelsSpecialist, ActivitiesSpecialist]
+    - Workflows
+  workflow:
+    start: gather_preferences
+    executors: [gather_preferences, flights, hotels, activities, consolidate, finalize_itinerary]
+    checkpointing: FileCheckpointStorage
+    human_in_the_loop: optional (approval_gate via request_info)
 ```
+
+### 5. (Optional) Add a human approval gate
+
+To pause for review before the itinerary is written, insert an `ApprovalGate` executor between `consolidate` and `finalize`. It uses `ctx.request_info()` to pause and a `@response_handler` to resume:
+
+```python
+# travel_assistant/workflow.py
+class ApprovalGate(Executor):
+    def __init__(self) -> None:
+        super().__init__(id="approval_gate")
+
+    @handler
+    async def request_approval(self, request: ApprovalRequest, ctx: WorkflowContext[str]) -> None:
+        await ctx.request_info(request_data=request, response_type=str)
+
+    @response_handler
+    async def on_approval(self, original_request: ApprovalRequest, feedback: str, ctx: WorkflowContext[AgentExecutorRequest]) -> None:
+        approved = feedback.strip().lower() in {"approve", "approved", "looks good", "finalise"}
+        prompt = _finalize_prompt(original_request.draft, "" if approved else feedback)
+        await ctx.send_message(
+            AgentExecutorRequest(messages=[Message(role="user", contents=[prompt])], should_respond=True),
+            target_id="finalize_itinerary",
+        )
+```
+
+The provided solution wires this in when you call `build_workflow(require_approval=True)`. Locally you drive it with a streaming loop:
+
+```python
+# travel_assistant/workflow.py
+stream = workflow.run(prompt, stream=True)
+while True:
+    pending = {}
+    async for event in stream:
+        if event.type == "request_info":
+            pending[event.request_id] = event.data
+        elif event.type == "output":
+            print(event.data)
+    if not pending:
+        break
+    responses = {rid: input("Approve or request changes: ") for rid in pending}
+    stream = workflow.run(stream=True, responses=responses)
+```
+
+When hosted, that `request_info` is surfaced to the caller as a **function call** instead — so keep `require_approval=False` for the default hosted run and use the local loop for an interactive approval demo.
 
 ## Run and deploy TravelBuddy
 
-`azd ai agent init` **copies** your `travel_assistant/` code into the generated `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder — that copy is the snapshot azd builds and deploys. You changed code in `travel_assistant/`, so **re-init** to refresh the snapshot. There are **no** new variables to `azd env set` (reuse the azd environment from earlier steps) and you do **not** run `azd provision` — you added no Azure resource (`resources:` is still `[]`, and no new project role is required).
+`azd ai agent init` **copies** your `travel_assistant/` code into the generated `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/` project folder — that copy is the snapshot azd builds and deploys. You changed code in `travel_assistant/`, so **re-init** to refresh the snapshot. There are **no** new variables to `azd env set` (reuse the azd environment from earlier steps) and you do **not** run `azd provision` — you added no Azure resource (`resources:` is still `[]`).
 
 1. **Re-init from the repository root.** Load your `.env` into the shell first so `WORKSHOP_RESOURCE_PREFIX` expands:
 
@@ -235,7 +355,7 @@ metadata:
      --agent-name "$($env:WORKSHOP_RESOURCE_PREFIX)-travel-buddy"
    ```
 
-2. **Run TravelBuddy locally** and invoke the Coordinator from a second terminal:
+2. **Run TravelBuddy locally** and invoke the workflow from a second terminal:
 
    <!-- terminal -->
    ```bash
@@ -247,86 +367,74 @@ metadata:
    <!-- terminal -->
    ```bash
    # terminal 2 — ask for a full trip plan:
-   azd ai agent invoke --local "Help me plan a 5-day Tokyo trip: flights from Lisbon, a hotel near Shibuya under €200/night, and a day-trip suggestion."
+   azd ai agent invoke --local "Plan a 5-day Tokyo trip for two with a budget of €3000."
    ```
 
-   A good trace shows the Coordinator consulting more than one specialist — depending on log level you may see the manager's speaker selections, specialist names in the messages, or per-specialist tool calls. Prefer a UI? With the local agent still running, open the **Agent Inspector** from the Foundry Toolkit (Command Palette → **Foundry Toolkit: Open Agent Inspector**).
+   A good trace shows `gather_preferences`, then `flights` / `hotels` / `activities` running together, then `consolidate`, then `finalize_itinerary`. Checkpoints appear under `.workshop-state/workflow-checkpoints/`.
 
 3. **Deploy to Foundry** and invoke the deployed agent:
 
    <!-- terminal -->
    ```bash
    azd deploy
-   azd ai agent invoke "Help me plan a 5-day Tokyo trip: flights from Lisbon, a hotel near Shibuya under €200/night, and a day-trip suggestion."
+   azd ai agent invoke "Plan a 5-day Tokyo trip for two with a budget of €3000."
    ```
 
-   `azd deploy` builds the container image from the **refreshed** snapshot, pushes it, and rolls out a new hosted agent version. The whole group chat deploys **inside** the single container, so nothing else is needed — no role grant, no `azd provision`.
+   `azd deploy` builds the container image from the **refreshed** snapshot, pushes it, and rolls out a new hosted agent version. The whole workflow deploys **inside** the single container, so nothing else is needed — no role grant, no `azd provision`.
 
 ## Try it
 
-- `Help me plan a 5-day Tokyo trip: flights from Lisbon, a hotel near Shibuya under €200/night, and a day-trip suggestion.` → expect the manager to consult all three specialists.
-- `Just the hotel — Reykjavik next weekend, must have a view.` → expect the manager to pick Hotels directly.
-- `I already booked flights to Rome. Build a relaxed food-and-history itinerary with one day trip.` → expect Activities, not Flights.
-- `Can you keep the whole Lisbon weekend under 600 EUR including hotel and activities?` → expect Hotels and Activities, with currency math.
+- `Plan a 5-day Tokyo trip for two with a budget of €3000.` → all three specialists contribute before the itinerary is finalized.
+- `Reykjavik for a long weekend, mid-range hotel, one day trip.` → same graph, different inputs.
+- Inspect the newest checkpoint:
 
-Then ask a **follow-up** in the same conversation (for example, after the Tokyo plan: `Swap the Shibuya hotel for something near Shinjuku instead.`). Because the manager terminates cleanly each turn, the follow-up just continues the conversation — no error.
+<!-- terminal -->
+```bash
+python -c "from pathlib import Path; print('\n'.join(str(p) for p in Path('.workshop-state/workflow-checkpoints').glob('*')))"
+```
+
+Notice a checkpoint records workflow state, executor progress, and the resume point. Don't edit checkpoint files by hand.
 
 ## Troubleshooting
 
-### A follow-up question fails (`Unexpected content type while awaiting request info responses`)
+### Workflow doesn't checkpoint
 
-If you've built multi-agent agents with **`HandoffBuilder`** before, you may have hit this: the **first** question works, but asking a **second** question in the same hosted conversation fails with a `response.failed` event:
+Pass `checkpoint_storage=` to `WorkflowBuilder(...)`. `FileCheckpointStorage` requires an explicit path — there is no default directory. It also deserializes with a restricted unpickler: pass any application-defined types you persist via `allowed_checkpoint_types=["module:qualname", ...]` (here `workflow:DraftPlan` and `workflow:ApprovalRequest`) or a resume raises `Type '…' is not allowed`. For a distributed deployment, swap in `CosmosCheckpointStorage` from `agent-framework-azure-cosmos`.
 
-```json
-"error": {
-  "code": "server_error",
-  "message": "Unexpected content type while awaiting request info responses."
-}
+### Re-runs always start from scratch
+
+List checkpoints from the storage and resume by id — there is no `get_latest`:
+
+```python
+# travel_assistant/workflow.py
+checkpoints = await storage.list_checkpoints(workflow_name=workflow.name)
+if checkpoints:
+    stream = workflow.run(checkpoint_id=checkpoints[-1].checkpoint_id, stream=True)
 ```
 
-That's a **handoff** symptom, and it's exactly why this step uses **group chat** instead. `HandoffBuilder` runs human-in-the-loop by default: after each turn it *parks* the workflow in `IDLE_WITH_PENDING_REQUESTS`, expecting the next input as a `function_result` correlated to that request — but the hosted `ResponsesHostServer` delivers the follow-up as plain **text**, which the parked workflow can't consume. `GroupChatBuilder` never parks: the manager explicitly **terminates** each turn, the workflow goes `IDLE`, and the hosting layer replays history for the next question. So with the group chat you built here, follow-ups just work.
+### Specialists run sequentially instead of together
 
-If you're adapting an older handoff-based Step 7 and see this error, the fix is to move to the group chat shape in this step (or, if you must keep the handoff, terminate each turn instead of parking). For background on the parked-request protocol, see the Agent Framework [handoff orchestration docs](https://learn.microsoft.com/agent-framework/user-guide/agent-orchestration/handoff).
+Fan out **from the same parent** — three edges out of `gather_preferences`. If you chain `gather → flights → hotels → activities`, each waits for the previous one.
 
-### The Coordinator asks questions instead of planning
+### Final itinerary appears before approval
 
-If the first turn comes back with "what are your dates, how many travelers, which cabin class?", the manager is treating missing details as blocking. Check that `COORDINATOR_INSTRUCTIONS` still carries its **"Plan first, ask almost never"** section and that each specialist keeps its "never stop to ask the traveler for details … assume the obvious default and label it as an assumption" boundary. Agents default to asking; you have to tell them to assume. One question is by design, though: if you never said where you're flying from, the Coordinator is allowed to close with that single question — *after* the rest of the plan.
+Confirm `finalize_itinerary` has an incoming edge only from `approval_gate` (when approval is enabled), not also from `consolidate`.
 
-### Coordinator picks the wrong specialist
+### Approval never pauses when hosted
 
-The manager chooses the next speaker from each participant's **`description`** plus `COORDINATOR_INSTRUCTIONS`. Make each specialist `description` unambiguous and each name descriptive, and keep the routing rules in the Coordinator's brief crisp. If the manager consistently picks wrong or terminates too early, strengthen those rules. A weak model can also be the cause: on this multi-agent step the shared context grows quickly, and `-mini` deployments often mis-route — if your prompts already look right, try a full-size model deployment (see the model tip at the top of this step).
-
-### Tool not available to a specialist
-
-Each specialist gets only the capabilities you pass it in `coordinator.py` (and documents them in its `agents/*/agent.manifest.yaml` slice). Add the tool to the specialist that needs it and restart the server so the graph is rebuilt.
-
-### Specialist answers outside its lane
-
-Tighten that specialist's boundary text — e.g. Flights should explicitly say it does not choose hotels or activities. A narrow prompt is often more effective than more routing logic.
-
-### Imports fail after adding `coordinator.py`
-
-The delivered `coordinator.py` imports `get_weather`, `get_local_time`, and `convert_currency` from your `tools.py`, and expects your local skills in `skills/`. If you renamed either in Steps 2–6, update the import (or the `LOCAL_SKILLS_DIR` path) at the top of `coordinator.py` to match.
-
-### Deploy fails with `400 invalid_payload` on `description`
-
-```text
-"message": "String length 568 exceeds maximum 512", "param": "description"
-```
-
-Foundry caps the agent `description` at **512 characters**. The manifest description grows with every step, so trim it — describe the shape of the agent, not every tool — and re-run `azd ai agent init` before `azd deploy`.
+Hosted workflow-agents surface `request_info` as a **function call**, not a prompt. For an interactive approval demo, run the local streaming loop with `responses=`; keep `require_approval=False` for the default `azd ai agent invoke` path.
 
 ### Deploy didn't pick up my change
 
-`azd ai agent init` **copied** your code into `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/`. Re-run `azd ai agent init` to refresh the snapshot, then `azd deploy` again.
+`azd ai agent init` **copied** your code into `${WORKSHOP_RESOURCE_PREFIX}-travel-buddy/`. Re-run `azd ai agent init`, then `azd deploy` again.
 
 ## Solution
 
-> If you get stuck: [`.workshop/solutions/07-multi-agent/`](.workshop/solutions/07-multi-agent/)
+> If you get stuck: [`.workshop/solutions/08-workflow/`](.workshop/solutions/08-workflow/)
 
 ## Upstream sample
 
-> The Foundry hosted-agents `responses/` gallery has no dedicated group chat sample, so this step follows the Agent Framework [group chat orchestration](https://learn.microsoft.com/agent-framework/user-guide/agent-orchestration/group-chat) docs and the canonical group chat samples in the Agent Framework repo: [`group_chat_agent_manager.py`](https://github.com/microsoft/agent-framework/blob/main/python/samples/03-workflows/orchestrations/group_chat_agent_manager.py) — which, like this step, uses an LLM manager (`orchestrator_agent`) to select the next speaker — plus [`group_chat_simple_selector.py`](https://github.com/microsoft/agent-framework/blob/main/python/samples/03-workflows/orchestrations/group_chat_simple_selector.py) ([full orchestrations gallery](https://github.com/microsoft/agent-framework/tree/main/python/samples/03-workflows/orchestrations)). Step 8 re-expresses the same scenario using the workflow pattern from [`05-workflows`](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/05-workflows).
+> Adapted from the upstream [`05-workflows`](https://github.com/microsoft-foundry/foundry-samples/tree/main/samples/python/hosted-agents/agent-framework/responses/05-workflows) sample, which hosts a writer → legal → formatter workflow with `WorkflowBuilder(...).build().as_agent()`.
 
 
 ---
@@ -336,13 +444,13 @@ Foundry caps the agent `description` at **512 characters**. The manifest descrip
 
 ## ✅ Done with this step? Push to advance.
 
-**Next:** Step 08 — Workflow (experimental)
+**Next:** Step 09 — Memory (experimental)
 
-Commit the files you created or edited in this step and push them to `main`. The push automatically loads Step 08 — there is no button to click.
+Commit the files you created or edited in this step and push them to `main`. The push automatically loads Step 09 — there is no button to click.
 
 ```bash
 git add -A
-git commit -m "Complete step 7"
+git commit -m "Complete step 8"
 git push
 ```
 
@@ -350,7 +458,7 @@ After the **Advance workshop on push to main** Action finishes, run **`git pull`
 
 > Each push to `main` advances the workshop by exactly **one** step, so push once — when this step is done.
 
-> **Prefer to stay local?** Run `python .workshop/scripts/advance_step.py --expected-current-step 7 --auto-commit` (or `make advance`) instead. That advances locally and records it in the same commit, so your next push won't advance again. See [Working fully locally](.workshop/docs/steps/00-intro.md#5-working-fully-locally-no-github-actions).
+> **Prefer to stay local?** Run `python .workshop/scripts/advance_step.py --expected-current-step 8 --auto-commit` (or `make advance`) instead. That advances locally and records it in the same commit, so your next push won't advance again. See [Working fully locally](.workshop/docs/steps/00-intro.md#5-working-fully-locally-no-github-actions).
 
 <sub>Made a mistake on this step? Re-lay its clean starter files with the [Reset current step](https://github.com/AdityaPadhy/ai-workshop-project/actions/workflows/reset-current-step.yml) workflow, or run `python .workshop/scripts/advance_step.py --reset-current --auto-commit` locally — you stay on this step. To start the whole workshop over instead, use [Reset workshop](https://github.com/AdityaPadhy/ai-workshop-project/actions/workflows/reset-workshop.yml) or `python .workshop/scripts/advance_step.py --reset --auto-commit`.</sub>
 
